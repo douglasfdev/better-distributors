@@ -51,8 +51,7 @@ function chooseImage(gallery) {
     }, { once: true });
     // Must click in the same event loop as user gesture
     try {
-        // Use requestAnimationFrame to keep the click in the same user‑gesture stack
-        requestAnimationFrame(() => input.click());
+        input.click();
     } catch (_) {
         cleanup();
         reject(new Error('Não foi possível abrir a câmera ou a galeria neste navegador.'));
@@ -60,65 +59,88 @@ function chooseImage(gallery) {
   });
 }
 
-// Fallback using getUserMedia for camera (HTTPS only, fallback to file input otherwise)
-async function captureCamera() {
-  if (!window.isSecureContext) {
-    throw new Error('Câmera requer HTTPS ou desenvolvimento local.');
+// Live streams cannot be seeked. Let the user frame and confirm a decoded frame.
+function captureCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    return Promise.reject(new Error('Câmera indisponível. Use HTTPS e um navegador compatível ou toque em Galeria.'));
   }
-  if (!('mediaDevices' in window) || !navigator.mediaDevices.getUserMedia) {
-    throw new Error('Este navegador não suporta câmera via getUserMedia.');
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+  return new Promise((resolve, reject) => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.setAttribute('aria-label', 'Fotografar cartão');
+    dialog.style.cssText = 'width:min(92vw,640px);border:0;border-radius:16px;padding:16px;';
     const video = document.createElement('video');
     video.autoplay = true;
+    video.muted = true;
     video.playsInline = true;
-    document.body.appendChild(video);
-    video.srcObject = stream;
-    await video.play();
-    
-    // Wait for video dimensions to be ready
-    await new Promise((resolve) => {
-      video.onloadedmetadata = () => {
-        video.currentTime = 1;
-        video.onseeked = () => {
-          resolve();
-        };
-        const seek = setInterval(() => {
-          if (video.currentTime >= 1) {
-            clearInterval(seek);
-            resolve();
-          }
-        }, 100);
-      };
+    video.style.cssText = 'display:block;width:100%;max-height:65vh;background:#111;';
+    const take = document.createElement('button');
+    take.type = 'button';
+    take.textContent = 'Tirar foto';
+    take.disabled = true;
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancelar';
+    dialog.append(video, take, cancel);
+    document.body.append(dialog);
+    let stream;
+    let finished = false;
+    let timer;
+    function finish(error, blob) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      window.removeEventListener('pagehide', onLeave);
+      stream?.getTracks().forEach(track => track.stop());
+      video.pause();
+      video.srcObject = null;
+      dialog.close();
+      dialog.remove();
+      previousFocus?.focus();
+      if (error) reject(error); else resolve(blob);
+    }
+    const onLeave = () => finish(new Error('Captura cancelada.'));
+    cancel.onclick = onLeave;
+    dialog.addEventListener('cancel', event => { event.preventDefault(); onLeave(); });
+    window.addEventListener('pagehide', onLeave);
+    video.addEventListener('loadeddata', () => {
+      if (video.videoWidth && video.videoHeight) {
+        clearTimeout(timer);
+        take.disabled = false;
+        take.focus();
+      }
     });
-
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0);
-    
-    // Stop camera and remove video
-    stream.getTracks().forEach(t => t.stop());
-    video.parentNode?.removeChild(video);
-    
-    return new Promise((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (!blob) {
-          reject(new Error('Não foi possível capturar a imagem da câmera.'));
-          return;
-        }
-        resolve(blob);
-      }, 'image/jpeg', 0.9);
-    });
-  } catch (error) {
-    throw new Error(`Não foi possível acessar a câmera: ${error?.message || String(error)}`);
-  }
+    video.addEventListener('error', () => finish(new Error('Não foi possível carregar a câmera. Toque em Galeria.')));
+    take.onclick = () => {
+      take.disabled = true;
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        canvas.toBlob(blob => finish(blob ? null : new Error('Não foi possível capturar a imagem.'), blob), 'image/jpeg', 0.9);
+      } catch (error) { finish(error); }
+    };
+    dialog.showModal();
+    cancel.focus();
+    timer = setTimeout(() => finish(new Error('A câmera demorou para responder. Tente novamente ou toque em Galeria.')), 30000);
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+      .then(async acquired => {
+        // Permission can resolve after cancellation; never leak that late stream.
+        if (finished) { acquired.getTracks().forEach(track => track.stop()); return; }
+        stream = acquired;
+        stream.getTracks().forEach(track => track.addEventListener('ended', () => finish(new Error('A câmera foi desconectada.'))));
+        video.srcObject = stream;
+        await video.play();
+      })
+      .catch(() => finish(new Error('Não foi possível acessar a câmera. Verifique a permissão ou toque em Galeria.')));
+  });
 }
 
 async function scanImageImpl(gallery) {
-  const file = await chooseImage(gallery);
+  // Quando gallery===false queremos usar a câmera nativa (getUserMedia) para evitar o seletor de arquivos.
+  // Quando gallery===true usamos o seletor de arquivos tradicional.
+  const file = gallery ? await chooseImage(true) : await captureCameraFile();
   const Tesseract = await loadOcr();
   let worker;
   try {
@@ -134,6 +156,14 @@ async function scanImageImpl(gallery) {
     if (worker) await worker.terminate();
   }
 }
+
+// Helper that returns a File object wrapping the Blob captured via getUserMedia.
+async function captureCameraFile() {
+  const blob = await captureCamera();
+  // Cria um File para manter a mesma API que chooseImage() devolve.
+  return new File([blob], 'camera.jpg', { type: blob.type || 'image/jpeg' });
+}
+
 
 async function locateImpl() {
   if (!window.isSecureContext) throw new Error('A localização exige HTTPS ou acesso por localhost.');
