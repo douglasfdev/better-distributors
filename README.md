@@ -86,7 +86,7 @@ O servidor carrega automaticamente o arquivo **`.env` na raiz do projeto** (`car
 | `BIND_ADDR` | `127.0.0.1:3000` | Endereço do painel (PC) |
 | `FRONTEND_DIST` | `frontend/dist` | Build do frontend servido pelo backend |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Hosts autorizados à API local |
-| `CAPTURE_PUBLIC_URL` | (definida) | Origem **HTTPS** que o celular acessa; habilita o QR |
+| `CAPTURE_PUBLIC_URL` | (definida) | Origem que o celular acessa: HTTPS (túnel) ou HTTP local com `CAPTURE_ALLOW_HTTP=1` |
 | `CAPTURE_BIND_ADDR` | `127.0.0.1:3001` | Porta da página pública de captura |
 | `CAPTURE_FRONTEND_DIR` | `frontend` | Pasta com `capture.html`/`bridge.js` |
 
@@ -105,6 +105,18 @@ cargo run -p distributor-server
 ```
 
 O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos, permite um único envio e não expõe lojas, painel nem a foto do cartão — o OCR roda no próprio navegador.
+
+### Alternativa offline (mesma rede, sem túnel)
+
+Sem internet ou sem domínio, o pareamento funciona por HTTP na rede local. No `.env`:
+
+```dotenv
+CAPTURE_ALLOW_HTTP=1
+CAPTURE_PUBLIC_URL=http://192.168.0.50:3001   # IP do PC (ipconfig)
+CAPTURE_BIND_ADDR=0.0.0.0:3001
+```
+
+Libere a porta 3001 no firewall do Windows (rede privada). Nesse modo, **a câmera usa o app nativo do celular** e a digitação manual (“Colar texto”) funciona sem internet; o OCR da foto precisa de internet no celular para baixar o leitor. HTTP local é para teste/diário em rede confiável — para produção, prefira o túnel HTTPS.
 
 ## Estrutura
 

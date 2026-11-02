@@ -47,18 +47,25 @@ struct Session {
 }
 
 impl Captures {
-    pub fn configured(value: Option<String>) -> Result<Self, &'static str> {
-        let origin = value.map(|value| {
-            let invalid = "CAPTURE_PUBLIC_URL must be an HTTPS origin only (https://capture.example), without credentials, path, query or fragment";
-            let uri = value.parse::<axum::http::Uri>().map_err(|_| invalid)?;
-            if uri.scheme_str() != Some("https") || uri.host().is_none()
-                || uri.authority().is_some_and(|a| a.as_str().contains('@'))
-                || uri.path_and_query().is_some_and(|p| p.as_str() != "/" && !p.as_str().is_empty())
-                || value.contains(['#', '?', '\\']) {
-                return Err(invalid);
-            }
-            Ok(format!("https://{}", uri.authority().ok_or(invalid)?))
-        }).transpose()?;
+    pub fn configured(value: Option<String>, allow_http: bool) -> Result<Self, &'static str> {
+        let invalid = "CAPTURE_PUBLIC_URL deve ser apenas uma origem (https://capture.example ou, em rede local, http://192.168.0.10:3001), sem credenciais, caminho, query ou fragmento";
+        let origin = value
+            .map(|value| {
+                let uri = value.parse::<axum::http::Uri>().map_err(|_| invalid)?;
+                let scheme = uri.scheme_str().ok_or(invalid)?;
+                if !(scheme == "https" || (allow_http && scheme == "http"))
+                    || uri.host().is_none()
+                    || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+                    || uri
+                        .path_and_query()
+                        .is_some_and(|p| !p.as_str().is_empty() && p.as_str() != "/")
+                    || value.contains(['#', '?', '\\'])
+                {
+                    return Err(invalid);
+                }
+                Ok(format!("{scheme}://{}", uri.authority().ok_or(invalid)?))
+            })
+            .transpose()?;
         let bind = origin.as_ref().map(|_| {
             std::env::var("CAPTURE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".into())
         });
@@ -68,11 +75,25 @@ impl Captures {
             ..Self::default()
         })
     }
-    pub fn from_env() -> Result<Self, String> {
-        Self::configured(std::env::var("CAPTURE_PUBLIC_URL").ok()).map_err(str::to_owned)
+    /// Invalid setup never aborts startup: returns the server plus a warning to print.
+    pub fn from_values(value: Option<String>, allow_http: bool) -> (Self, Option<String>) {
+        match Self::configured(value, allow_http) {
+            Ok(captures) => (captures, None),
+            Err(reason) => (Self::default(), Some(reason.to_owned())),
+        }
+    }
+    pub fn from_env() -> (Self, Option<String>) {
+        let allow_http = matches!(
+            std::env::var("CAPTURE_ALLOW_HTTP").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
+        Self::from_values(std::env::var("CAPTURE_PUBLIC_URL").ok(), allow_http)
     }
     pub fn enabled(&self) -> bool {
         self.origin.is_some()
+    }
+    pub fn origin_url(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
     pub fn public_bind(&self) -> Option<String> {
         self.bind.clone()
@@ -348,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_flow() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (id, read, write) = open_session(state.clone()).await;
         let (status, body) = poll(state.clone(), &id, &read).await;
         assert_eq!(status, StatusCode::OK);
@@ -383,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn expiry_prunes_and_frees_slot() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (first, read_first, _) = open_session(state.clone()).await;
         let (second, read_second, _) = open_session(state.clone()).await;
         {
@@ -402,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_sessions_enforced() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         for _ in 0..MAX_SESSIONS {
             open_session(state.clone()).await;
         }
@@ -418,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_removes_session() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (id, read, _) = open_session(state.clone()).await;
         let request = Request::builder()
             .method("DELETE")
@@ -435,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_single_use_and_replay_rejected() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, _, write) = open_session(state.clone()).await;
         let body = Some(json!({"text":"first"}));
         let (status, _) = public_post(
@@ -469,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_authorization_enforced() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (id, read, write) = open_session(state.clone()).await;
         for (path, write_) in [
             ("/api/capture/connect", read.as_str()),
@@ -503,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_routes_never_serve_admin() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         for path in [
             "/",
             "/index.html",
@@ -531,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_requires_matching_origin() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, _, write) = open_session(state.clone()).await;
         let body = Some(json!({"text":"x"}));
         for origin in ["https://evil.example", "http://capture.test"] {
@@ -558,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_limits() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, _, write) = open_session(state.clone()).await;
         let (status, _) = public_post(
             state.clone(),
@@ -591,21 +612,39 @@ mod tests {
 
     #[tokio::test]
     async fn config_rejects_http_scheme() {
-        let err = Captures::configured(Some("http://capture.test".into())).unwrap_err();
-        assert!(err.contains("HTTPS"));
-        assert!(Captures::configured(Some("https://capture.test/login?next=x".into())).is_err());
-        assert!(Captures::configured(Some("https://user@capture.test".into())).is_err());
-        assert!(Captures::configured(Some("https://capture.test/path".into())).is_err());
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let err = Captures::configured(Some("http://capture.test".into()), false).unwrap_err();
+        assert!(err.contains("origem") || err.contains("http://"));
+        assert!(
+            Captures::configured(Some("https://capture.test/login?next=x".into()), false).is_err()
+        );
+        assert!(Captures::configured(Some("https://user@capture.test".into()), false).is_err());
+        assert!(Captures::configured(Some("https://capture.test/path".into()), false).is_err());
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         assert!(state.enabled());
-        let unconfigured = Captures::configured(None).unwrap();
+        // Modo rede local: HTTP só com o flag explícito CAPTURE_ALLOW_HTTP.
+        assert!(Captures::configured(Some("http://capture.test".into()), false).is_err());
+        let lan = Captures::configured(Some("http://192.168.0.10:3001".into()), true).unwrap();
+        assert!(lan.enabled());
+        assert_eq!(lan.origin_url(), Some("http://192.168.0.10:3001"));
+        let unconfigured = Captures::configured(None, false).unwrap();
         assert!(!unconfigured.enabled());
         assert!(unconfigured.public_bind().is_none());
     }
 
     #[tokio::test]
+    async fn invalid_config_never_aborts_startup() {
+        let (captures, warning) =
+            Captures::from_values(Some("https://capture.test/login".into()), false);
+        assert!(warning.is_some());
+        assert!(!captures.enabled());
+        let (captures, warning) = Captures::from_values(None, false);
+        assert!(warning.is_none());
+        assert!(!captures.enabled());
+    }
+
+    #[tokio::test]
     async fn create_without_config_is_actionable_503() {
-        let state = Captures::configured(None).unwrap();
+        let state = Captures::configured(None, false).unwrap();
         let request = Request::builder()
             .method("POST")
             .uri("/api/captures")
@@ -626,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn tokens_unique_per_session() {
-        let state = Captures::configured(Some("https://capture.test".into())).unwrap();
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, read_a, write_a) = open_session(state.clone()).await;
         let (_, read_b, write_b) = open_session(state.clone()).await;
         assert_ne!(read_a, read_b);

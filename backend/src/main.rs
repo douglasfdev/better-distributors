@@ -90,7 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://distributors.db?mode=rwc".into());
     let pool = database(&url).await?;
-    let captures = Captures::from_env()?;
+    let (captures, warning) = Captures::from_env();
+    if let Some(reason) = warning {
+        eprintln!("Captura por QR desativada: {reason}");
+    }
     let dist = std::env::var("FRONTEND_DIST").unwrap_or_else(|_| "frontend/dist".into());
     let service =
         ServeDir::new(&dist).not_found_service(ServeFile::new(format!("{dist}/index.html")));

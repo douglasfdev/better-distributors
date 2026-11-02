@@ -346,14 +346,16 @@ pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
     };
 
     view! {
-        <button
-            class="secondary"
-            type="button"
-            disabled=move || status.get() == "creating"
-            on:click=start_click
-        >
-            {move || if status.get() == "creating" { "Abrindo…" } else { "📱 Escanear com celular" }}
-        </button>
+        <Show when=move || !open.get()>
+            <button
+                class="secondary capture-pulse"
+                type="button"
+                disabled=move || status.get() == "creating"
+                on:click=start_click
+            >
+                {move || if status.get() == "creating" { "Abrindo…" } else { "📱 Escanear com celular" }}
+            </button>
+        </Show>
         <Show when=move || open.get()>
             <div class="capture-panel" role="region" aria-label="Captura pelo celular">
                 <div class="section-heading">

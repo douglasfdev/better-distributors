@@ -306,7 +306,9 @@ fn App() -> impl IntoView {
                     <header class="page-header"><div><p class="eyebrow">"CRESÇA SUA REDE"</p><h1>{move ||if value(&fields.get(),"id").is_empty(){"Uma nova conexão."}else{"Editar conexão."}}</h1><p class="muted">"Guarde os detalhes de quem pode fazer seu negócio ir além."</p></div><span class="header-tag">"✦ Tudo começa com um contato"</span></header>
                     <div class="registration-layout"><div>
                     <section class="card scan-card"><div class="scan-icon">"⌁"</div><div><h3>"Do cartão para sua rede."</h3><p class="muted">"Fotografe um cartão ou escolha uma imagem. Revise os dados antes de salvar."</p></div><button class="secondary" disabled=move ||busy.get() on:click=move |_| {busy.set(true);spawn_local(async move {match scan_image().await {Ok(v)=>ocr.set(v.as_string().unwrap_or_default()),Err(e)=>message.set(js_error(e))} busy.set(false);});}>"Escanear cartão ↗"</button></section>
-                    <CapturePanel ocr=ocr />
+                    <div class="qr-button-wrapper">
+                        <CapturePanel ocr=ocr />
+                    </div>
                     <Show when=move ||!ocr.get().is_empty()><section class="card"><h3>"Texto reconhecido · revise antes de aplicar"</h3><textarea aria-label="Texto reconhecido" prop:value=move ||ocr.get() on:input=move |e|ocr.set(event_target_value(&e))></textarea><button type="button" class="secondary" on:click=move |_| {
                         let text=ocr.get_untracked(); fields.update(|f| {
                             let mut suggestions=vec![];

@@ -99,7 +99,21 @@
   </main>
 
   <script type="module">
+// Request camera permission proactively to trigger browser prompt (helps on some Android browsers)
+async function requestCameraPermission(){
+  if(!('mediaDevices' in navigator && navigator.mediaDevices.getUserMedia)) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:true});
+    // Stop all tracks immediately
+    stream.getTracks().forEach(t=>t.stop());
+  } catch(e){
+    // ignore errors; permission may be denied or not needed
+  }
+}
+
     import { scanImage } from '/bridge.js';
+// Solicita permissão da câmera assim que a página carrega (melhora a experiência em dispositivos móveis)
+requestCameraPermission();
 
     const els = Object.fromEntries(
       ['state-invalid','state-connecting','state-ready','state-sending','state-done','btn-camera',
@@ -183,11 +197,30 @@
       els['btn-camera'].disabled = true;
       els['btn-gallery'].disabled = true;
       try {
+        // Se a câmera não foi usada, faça um pedido de permissão à câmera
+        if (!gallery) {
+          await requestCameraPermission();
+        }
         const text = await scanImage(gallery);
         els.scanStatus.classList.add('hidden');
         review(text);
       } catch (error) {
-        els.scanStatus.textContent = error?.message || String(error);
+        // Se a tentativa de usar a câmera falhar, faz fallback automático para a galeria.
+        if (!gallery) {
+          // Mensagem amigável para o usuário antes do fallback.
+          alert('A câmera não está disponível neste navegador. Abrindo a galeria…', false);
+          // Tenta novamente usando a galeria.
+          try {
+            const text = await scanImage(true);
+            els.scanStatus.classList.add('hidden');
+            review(text);
+          } catch (e) {
+            // Se também falhar, mostra o erro final.
+            els.scanStatus.textContent = e?.message || String(e);
+          }
+        } else {
+          els.scanStatus.textContent = error?.message || String(error);
+        }
       } finally {
         els['btn-camera'].disabled = submitted;
         els['btn-gallery'].disabled = submitted;
@@ -205,6 +238,9 @@
         if (text && text.trim()) review(text);
       }
     }
+
+    // Make scan globally accessible for the fallback wrapper
+    window.scan = scan;
 
     els['btn-camera'].addEventListener('click', () => scan(false));
     els['btn-gallery'].addEventListener('click', () => scan(true));
@@ -257,6 +293,19 @@
         handleError(error);
       }
     })();
+
+    // Fallback simples: se scanImage falhar com câmera (gallery=false), tenta galeria.
+    const originalScan = window.scan;
+    window.scan = async function(gallery) {
+      if (gallery) return originalScan(true);
+      try {
+        return await originalScan(false);
+      } catch (e) {
+        // Se a câmera falhou, avisa e tenta galeria
+        alert('A câmera não abriu. Tentando galeria…', false);
+        return originalScan(true);
+      }
+    };
   </script>
 </body>
 </html>

@@ -32,7 +32,8 @@ function chooseImage(gallery) {
     input.type = 'file';
     input.accept = 'image/*';
     if (!gallery) input.setAttribute('capture', 'environment');
-    input.style.display = 'none';
+    // Use opacity/position instead of display:none so mobile browsers allow the click
+    input.style.cssText = 'position:fixed;top:0;left:0;opacity:0;width:100%;height:100%;';
     document.body.append(input);
     function cleanup() { input.remove(); }
     input.addEventListener('cancel', () => {
@@ -48,11 +49,72 @@ function chooseImage(gallery) {
       if (file.size > 12 * 1024 * 1024) return reject(new Error('A imagem deve ter no máximo 12 MB.'));
       resolve(file);
     }, { once: true });
-    try { input.click(); } catch (_) {
-      cleanup();
-      reject(new Error('Não foi possível abrir a câmera ou a galeria neste navegador.'));
+    // Must click in the same event loop as user gesture
+    try {
+        // Use requestAnimationFrame to keep the click in the same user‑gesture stack
+        requestAnimationFrame(() => input.click());
+    } catch (_) {
+        cleanup();
+        reject(new Error('Não foi possível abrir a câmera ou a galeria neste navegador.'));
     }
   });
+}
+
+// Fallback using getUserMedia for camera (HTTPS only, fallback to file input otherwise)
+async function captureCamera() {
+  if (!window.isSecureContext) {
+    throw new Error('Câmera requer HTTPS ou desenvolvimento local.');
+  }
+  if (!('mediaDevices' in window) || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('Este navegador não suporta câmera via getUserMedia.');
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    document.body.appendChild(video);
+    video.srcObject = stream;
+    await video.play();
+    
+    // Wait for video dimensions to be ready
+    await new Promise((resolve) => {
+      video.onloadedmetadata = () => {
+        video.currentTime = 1;
+        video.onseeked = () => {
+          resolve();
+        };
+        const seek = setInterval(() => {
+          if (video.currentTime >= 1) {
+            clearInterval(seek);
+            resolve();
+          }
+        }, 100);
+      };
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0);
+    
+    // Stop camera and remove video
+    stream.getTracks().forEach(t => t.stop());
+    video.parentNode?.removeChild(video);
+    
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('Não foi possível capturar a imagem da câmera.'));
+          return;
+        }
+        resolve(blob);
+      }, 'image/jpeg', 0.9);
+    });
+  } catch (error) {
+    throw new Error(`Não foi possível acessar a câmera: ${error?.message || String(error)}`);
+  }
 }
 
 async function scanImageImpl(gallery) {
