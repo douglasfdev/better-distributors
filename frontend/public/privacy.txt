@@ -1,0 +1,13 @@
+Better Distributors — informações de privacidade do MVP local
+
+Os cadastros são armazenados no arquivo SQLite do servidor. Esta versão não possui contas de usuário: qualquer pessoa com acesso à API pode consultar e alterar os registros.
+
+O reconhecimento de texto (OCR) processa a foto no navegador. A imagem não é enviada ao servidor da aplicação e não é guardada no cadastro. Bibliotecas e modelos de idioma são baixados de CDNs externos.
+
+Mapas usam Leaflet e tiles OpenStreetMap. Fontes e bibliotecas podem vir de Google Fonts, unpkg e jsDelivr. Esses provedores recebem requisições do navegador (incluindo endereço IP); os tiles solicitados indicam a área visualizada.
+
+Geolocalização é solicitada apenas por ação do usuário. Confirme que as coordenadas correspondem à loja antes de salvar.
+
+Links de catálogo, WhatsApp, site e navegação abrem serviços externos com suas próprias políticas.
+
+Antes de uma implantação pública, configure autenticação, autorização, HTTPS, backups, base legal para tratamento de dados, política de retenção e processo de exclusão conforme as necessidades da organização e a LGPD.

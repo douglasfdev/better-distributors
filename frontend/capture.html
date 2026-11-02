@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <meta name="referrer" content="no-referrer">
+  <title>Captura de cartão · Better Distributors</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+      padding: 24px 16px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #f4f4f2; color: #1d2b26;
+    }
+    main { width: 100%; max-width: 30rem; }
+    .card {
+      background: #fff; border: 1px solid #e3e6e2; border-radius: 16px;
+      padding: 24px 20px; box-shadow: 0 12px 32px rgba(24, 62, 50, 0.08);
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 4px; }
+    p { margin: 0 0 12px; font-size: 0.9rem; line-height: 1.45; }
+    .muted { color: #6b7a74; }
+    .eyebrow { font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: #183e32; font-weight: 700; }
+    button {
+      font: inherit; font-weight: 600; border: none; border-radius: 10px; padding: 12px 16px;
+      cursor: pointer; width: 100%;
+    }
+    button.primary { background: #183e32; color: #fff; }
+    button.secondary { background: #eef2ef; color: #183e32; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .actions { display: flex; gap: 10px; margin-top: 8px; }
+    .actions button { flex: 1; }
+    textarea, output {
+      width: 100%; font: inherit; font-size: 0.9rem; border: 1px solid #d5dbd7;
+      border-radius: 10px; padding: 10px; background: #fbfcfb; display: block;
+    }
+    textarea { min-height: 9rem; resize: vertical; }
+    output { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .error { color: #9c2f24; background: #fbeeed; border-radius: 10px; padding: 10px 12px; font-size: 0.85rem; }
+    .ok { color: #183e32; background: #e7f0eb; border-radius: 10px; padding: 10px 12px; font-size: 0.85rem; }
+    .hidden { display: none !important; }
+    footer { margin-top: 14px; text-align: center; font-size: 0.72rem; color: #8a938f; }
+    .spinner { display: inline-block; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card" id="app">
+      <p class="eyebrow">Better Distributors</p>
+
+      <div id="state-invalid">
+        <h1>Link de captura inválido</h1>
+        <p class="muted">Este link é usado uma única vez e junto do computador. Volte lá, gere um novo QR e aponte a câmera para ele.</p>
+      </div>
+
+      <div id="state-connecting" class="hidden">
+        <h1>Conectando…</h1>
+        <p class="muted"><span class="spinner" aria-hidden="true">◌</span> Validando a captura no seu computador.</p>
+      </div>
+
+      <div id="state-ready" class="hidden">
+        <h1>Captura conectada</h1>
+        <p class="muted">Fotografe o cartão ou escolha uma imagem. O texto é lido <strong>neste aparelho</strong>; nada é enviado antes de você revisar e confirmar.</p>
+        <div class="actions">
+          <button class="primary" id="btn-camera" type="button">📷 Fotografia</button>
+          <button class="secondary" id="btn-gallery" type="button">🖼️ Galeria</button>
+        </div>
+        <div class="actions">
+          <button class="secondary" id="btn-paste" type="button">📋 Colar texto</button>
+        </div>
+        <div id="scan-status" class="hidden"></div>
+        <div id="review" class="hidden">
+          <h1>Revise antes de enviar</h1>
+          <p class="muted">Edite o texto reconhecido. Ao enviar, ele aparece <strong>apenas</strong> na tela do computador para revisão — nada é salvo automaticamente.</p>
+          <textarea id="text" aria-label="Texto reconhecido" maxlength="32000"></textarea>
+          <div class="actions">
+            <button class="secondary" id="btn-discard" type="button">Descartar</button>
+            <button class="primary" id="btn-send" type="button">Enviar ao computador</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="state-sending" class="hidden">
+        <h1>Enviando…</h1>
+        <p class="muted">Garantindo que o texto chegou ao seu computador.</p>
+      </div>
+
+      <div id="state-done" class="hidden">
+        <h1>Texto enviado ✔</h1>
+        <p class="muted">Revise e aplique os dados direto no computador. Pode fechar esta página.</p>
+      </div>
+
+      <div id="alert" class="hidden" role="alert" style="margin-top: 12px;"></div>
+    </section>
+    <footer>Nesta sessão o texto só circula entre seu celular e seu computador.</footer>
+  </main>
+
+  <script type="module">
+    import { scanImage } from '/bridge.js';
+
+    const els = Object.fromEntries(
+      ['state-invalid','state-connecting','state-ready','state-sending','state-done','btn-camera',
+       'btn-gallery','btn-paste','scan-status','review','text','btn-discard','btn-send','alert']
+      .map(id => [id, document.getElementById(id)])
+    );
+
+    // The write token lives only in memory. showState() drives the page flow.
+    let token = '';
+    let submitted = false;
+
+    function alert(message, ok) {
+      els.alert.classList.remove('hidden', 'ok', 'error');
+      els.alert.classList.add(ok ? 'ok' : 'error');
+      els.alert.textContent = message;
+    }
+    function clearAlert() { els.alert.classList.add('hidden'); }
+    function showState(name) {
+      for (const id of ['state-invalid','state-connecting','state-ready','state-sending','state-done']) {
+        els[id].classList.toggle('hidden', id !== name);
+      }
+    }
+
+    // Extract the token from the fragment and strip it from the address bar
+    // immediately, so it is not kept in history, referrer or sharing sheets.
+    const parsed = window.location.hash.match(/^#token=([A-Za-z0-9-]+)$/);
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (parsed) token = parsed[1];
+
+    // fetch with timeout, single retry on transient network failure.
+    async function request(path, options = {}, tries = 2) {
+      for (let attempt = 1; attempt <= tries; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000);
+        try {
+          const response = await fetch(path, {
+            ...options,
+            signal: controller.signal,
+            headers: { ...(options.headers || {}), authorization: `Bearer ${token}` },
+          });
+          return response;
+        } catch (error) {
+          if (attempt === tries) throw new Error('Não foi possível falar com o computador. Toque em tentar de novo.');
+        } finally {
+          clearTimeout(timer);
+        }
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+    }
+
+    async function handleError(error) {
+      const raw = error?.message || String(error);
+      clearAlert?.();
+      const status = Number(error?.status || 0);
+      if ([401, 403, 409].includes(status)) {
+        showState('state-invalid');
+        alert(raw, false);
+        return;
+      }
+      showState('state-ready');
+      alert(raw, false);
+    }
+
+    function review(text) {
+      els.text.value = text.trim().slice(0, 32000);
+      els.review.classList.remove('hidden');
+      els['btn-send'].focus();
+    }
+
+    els['btn-discard'].addEventListener('click', () => {
+      els.review.classList.add('hidden');
+      els.text.value = '';
+      clearAlert();
+    });
+
+    async function scan(gallery) {
+      clearAlert();
+      els.scanStatus.classList.remove('hidden', 'ok', 'error');
+      els.scanStatus.classList.add('error');
+      els.scanStatus.textContent = 'Lendo a imagem neste aparelho…';
+      els['btn-camera'].disabled = true;
+      els['btn-gallery'].disabled = true;
+      try {
+        const text = await scanImage(gallery);
+        els.scanStatus.classList.add('hidden');
+        review(text);
+      } catch (error) {
+        els.scanStatus.textContent = error?.message || String(error);
+      } finally {
+        els['btn-camera'].disabled = submitted;
+        els['btn-gallery'].disabled = submitted;
+      }
+    }
+
+    async function pasteText() {
+      clearAlert();
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text || !text.trim()) throw new Error('clipboard-empty');
+        review(text);
+      } catch {
+        const text = window.prompt('Cole ou digite o texto do cartão:');
+        if (text && text.trim()) review(text);
+      }
+    }
+
+    els['btn-camera'].addEventListener('click', () => scan(false));
+    els['btn-gallery'].addEventListener('click', () => scan(true));
+    els['btn-paste'].addEventListener('click', pasteText);
+
+    els['btn-send'].addEventListener('click', async () => {
+      clearAlert();
+      const text = els.text.value.trim();
+      if (!text) { alert('Escreva o texto antes de enviar.', false); return; }
+      showState('state-sending');
+      try {
+        const response = await request('/api/capture/submit', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        if (response.status === 401 || response.status === 403 || response.status === 409) {
+          const raw = await response.json().then(b => b.error).catch(() => null);
+          showState('state-invalid');
+          alert(raw || 'Esta captura não é mais válida. Gere um novo QR no computador.', false);
+          return;
+        }
+        if (!response.ok) throw new Error('Não foi possível enviar o texto. Toque em tentar de novo.');
+        submitted = true;
+        els['btn-send'].disabled = true;
+        showState('state-done');
+      } catch (error) {
+        showState('state-ready');
+        await handleError(error);
+      }
+    });
+
+    (async () => {
+      if (!token) {
+        showState('state-invalid');
+        return;
+      }
+      showState('state-connecting');
+      try {
+        const response = await request('/api/capture/connect', { method: 'POST' });
+        if (response.ok) {
+          showState('state-ready');
+          els['btn-camera'].focus();
+        } else {
+          const raw = await response.json().then(b => b.error).catch(() => null);
+          handleError({ status: response.status, message: raw });
+        }
+      } catch (error) {
+        showState('state-invalid');
+        handleError(error);
+      }
+    })();
+  </script>
+</body>
+</html>

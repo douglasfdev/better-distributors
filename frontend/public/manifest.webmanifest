@@ -1,0 +1,11 @@
+{
+  "name": "Better Distributors · Fornecedores",
+  "short_name": "Better",
+  "lang": "pt-BR",
+  "description": "Sua rede de fornecedores, organizada.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f8f2",
+  "theme_color": "#183e32",
+  "icons": [{ "src": "/public/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
