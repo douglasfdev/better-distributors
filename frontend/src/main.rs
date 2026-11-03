@@ -167,6 +167,7 @@ fn App() -> impl IntoView {
     let selected = RwSignal::new(None::<Store>);
     let confirm = RwSignal::new(false);
     let ocr = RwSignal::new(String::new());
+    let pending = RwSignal::new(None::<(capture::Session, u64)>);
     spawn_local(load(stores, loading, message));
     let listener = gloo_events::EventListener::new(
         &web_sys::window().unwrap(),
@@ -256,6 +257,7 @@ fn App() -> impl IntoView {
             if duplicate && !web_sys::window().unwrap().confirm_with_message("Já existe uma loja com este nome ou telefone. Deseja cadastrar outra mesmo assim?").unwrap_or(false) { return; }
         }
         busy.set(true);
+        let capture_to_ack = pending.get_untracked();
         message.set(String::new());
         spawn_local(async move {
             let request = if store.id.is_empty() {
@@ -269,9 +271,17 @@ fn App() -> impl IntoView {
                         fields.set(Fields::new());
                         products.set(vec![]);
                         ocr.set(String::new());
-                        tab.set(1);
+                        if capture_to_ack.is_none() { tab.set(1); }
                         load(stores, loading, message).await;
                         message.set("Loja salva com sucesso.".into());
+                        if let Some((session, sequence)) = capture_to_ack {
+                            match capture::acknowledge(session.clone(), sequence).await {
+                                Ok(()) => pending.update(|current| {
+                                    if current.as_ref().is_some_and(|(active, seq)| active == &session && *seq == sequence) { *current = None; }
+                                }),
+                                Err(error) => message.set(format!("Loja salva. {error}")),
+                            }
+                        }
                     }
                     Ok(r) => {
                         let body = r.json::<serde_json::Value>().await.ok();
@@ -307,7 +317,7 @@ fn App() -> impl IntoView {
                     <div class="registration-layout"><div>
                     <section class="card scan-card"><div class="scan-icon">"⌁"</div><div><h3>"Do cartão para sua rede."</h3><p class="muted">"Fotografe um cartão ou escolha uma imagem. Revise os dados antes de salvar."</p></div><button class="secondary" disabled=move ||busy.get() on:click=move |_| {busy.set(true);spawn_local(async move {match scan_image().await {Ok(v)=>ocr.set(v.as_string().unwrap_or_default()),Err(e)=>message.set(js_error(e))} busy.set(false);});}>"Escanear cartão ↗"</button></section>
                     <div class="qr-button-wrapper">
-                        <CapturePanel ocr=ocr />
+                        <CapturePanel ocr=ocr pending=pending />
                     </div>
                     <Show when=move ||!ocr.get().is_empty()><section class="card"><h3>"Texto reconhecido · revise antes de aplicar"</h3><textarea aria-label="Texto reconhecido" prop:value=move ||ocr.get() on:input=move |e|ocr.set(event_target_value(&e))></textarea><button type="button" class="secondary" on:click=move |_| {
                         let text=ocr.get_untracked(); fields.update(|f| {

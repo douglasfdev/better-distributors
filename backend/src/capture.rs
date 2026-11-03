@@ -44,6 +44,8 @@ struct Session {
     deadline: Instant,
     connected: bool,
     text: Option<String>,
+    sequence: u64,
+    ended: bool,
 }
 
 impl Captures {
@@ -104,6 +106,7 @@ pub fn local_router(state: Captures) -> Router {
     Router::new()
         .route("/api/captures", post(create))
         .route("/api/captures/{id}", get(read).delete(cancel))
+        .route("/api/captures/{id}/ack", post(ack))
         .layer(middleware::from_fn_with_state(state.clone(), protect))
         .with_state(state)
 }
@@ -120,6 +123,8 @@ pub fn public_router(state: Captures, frontend: &str) -> Router {
         )
         .route("/api/capture/connect", post(connect))
         .route("/api/capture/submit", post(submit))
+        .route("/api/capture/status", post(connect))
+        .route("/api/capture/end", post(end))
         // JSON escaping may take six bytes per character; bound bytes as well as characters.
         .layer(DefaultBodyLimit::max(MAX_TEXT * 6 + 1024))
         .layer(middleware::from_fn_with_state(state.clone(), public_guard))
@@ -142,7 +147,7 @@ async fn protect(State(state): State<Captures>, request: Request, next: Next) ->
         ("x-content-type-options", "nosniff"),
         (
             "content-security-policy",
-            "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://tessdata.projectnaptha.com data:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
         ),
     ] {
         response
@@ -197,6 +202,8 @@ async fn create(State(state): State<Captures>) -> Result<(StatusCode, Json<Value
             deadline: Instant::now() + TTL,
             connected: false,
             text: None,
+            sequence: 1,
+            ended: false,
         },
     );
     Ok((StatusCode::CREATED, Json(result)))
@@ -215,10 +222,9 @@ async fn read(
     if s.deadline <= Instant::now() {
         return Ok(Json(json!({"status":"expired"})));
     }
-    Ok(Json(match &s.text {
-        Some(text) => json!({"status":"received", "text":text}),
-        None => json!({"status":if s.connected {"connected"} else {"waiting"}}),
-    }))
+    let mut result = session_status(s);
+    if !s.ended { result["text"] = json!(s.text); }
+    Ok(Json(result))
 }
 async fn cancel(
     State(state): State<Captures>,
@@ -242,9 +248,6 @@ fn writer<'a>(
         .values_mut()
         .find(|s| s.write == token && s.deadline > Instant::now())
         .ok_or_else(unauthorized)?;
-    if s.text.is_some() {
-        return Err(error(StatusCode::CONFLICT, "Esta captura já foi enviada."));
-    }
     Ok(s)
 }
 async fn connect(
@@ -252,8 +255,10 @@ async fn connect(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let token = bearer(&headers)?;
-    writer(&mut state.sessions.lock().unwrap(), token)?.connected = true;
-    Ok(Json(json!({"status":"connected"})))
+    let mut sessions = state.sessions.lock().unwrap();
+    let s = writer(&mut sessions, token)?;
+    s.connected = true;
+    Ok(Json(session_status(s)))
 }
 async fn submit(
     State(state): State<Captures>,
@@ -281,9 +286,42 @@ async fn submit(
             "O texto não pode estar vazio.",
         ));
     }
+    let sequence = body["sequence"].as_u64().ok_or_else(|| error(StatusCode::UNPROCESSABLE_ENTITY, "Informe a sequência."))?;
+    if s.ended || sequence != s.sequence || s.text.as_ref().is_some_and(|old| old != text) {
+        return Err(error(StatusCode::CONFLICT, "Captura fora de sequência ou encerrada."));
+    }
     s.text = Some(text.to_owned());
     s.connected = true;
     Ok(Json(json!({"status":"received"})))
+}
+
+fn session_status(s: &Session) -> Value {
+    json!({"status": if s.ended {"ended"} else if s.text.is_some() {"received"} else if s.connected {"connected"} else {"waiting"}, "sequence": s.sequence})
+}
+
+async fn end(State(state): State<Captures>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let mut sessions = state.sessions.lock().unwrap();
+    let s = writer(&mut sessions, bearer(&headers)?)?;
+    s.ended = true;
+    s.text = None;
+    Ok(Json(session_status(s)))
+}
+
+// Only the local reader can acknowledge a successfully saved capture. Duplicate
+// acknowledgements never advance a newer capture; all transitions share one lock.
+async fn ack(State(state): State<Captures>, Path(id): Path<String>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
+    let mut sessions = state.sessions.lock().unwrap();
+    let token = bearer(&headers)?;
+    let s = sessions.get_mut(&id).filter(|s| s.read == token && s.deadline > Instant::now()).ok_or_else(unauthorized)?;
+    let sequence = body["sequence"].as_u64().ok_or_else(|| error(StatusCode::UNPROCESSABLE_ENTITY, "Informe a sequência."))?;
+    if s.ended || sequence == 0 || sequence > s.sequence || (sequence == s.sequence && s.text.is_none()) {
+        return Err(error(StatusCode::CONFLICT, "Captura não disponível para confirmação."));
+    }
+    if sequence == s.sequence {
+        s.text = None;
+        s.sequence += 1;
+    }
+    Ok(Json(session_status(s)))
 }
 
 #[cfg(test)]
@@ -389,7 +427,7 @@ mod tests {
             state.clone(),
             "/api/capture/submit",
             &write,
-            Some(json!({"text":"hello there"})),
+            Some(json!({"sequence":1,"text":"hello there"})),
             Some("https://capture.test"),
         )
         .await;
@@ -400,6 +438,38 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(read.len(), 36);
         assert_eq!(write.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn reusable_sequence_ack_and_end() {
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
+        let (id, read, write) = open_session(state.clone()).await;
+        for sequence in 1..=2 {
+            let (status, _) = public_post(state.clone(), "/api/capture/submit", &write, Some(json!({"sequence":sequence,"text":"card"})), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = public_post(state.clone(), "/api/capture/submit", &write, Some(json!({"sequence":sequence+1,"text":"next"})), None).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            for token in [&write, &read, &read] {
+                let request = Request::builder().method("POST").uri(format!("/api/captures/{id}/ack"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"sequence":sequence}).to_string())).unwrap();
+                let response = local_router(state.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), if token == &write {StatusCode::UNAUTHORIZED} else {StatusCode::OK});
+            }
+            let (_, body) = poll(state.clone(), &id, &read).await;
+            assert_eq!(body["sequence"], sequence + 1);
+            assert_eq!(body["status"], "connected");
+            let (status, _) = public_post(state.clone(), "/api/capture/submit", &write, Some(json!({"sequence":sequence,"text":"stale"})), None).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+        for _ in 0..2 {
+            let (status, body) = public_post(state.clone(), "/api/capture/end", &write, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["status"], "ended");
+        }
+        let (status, _) = public_post(state.clone(), "/api/capture/submit", &write, Some(json!({"sequence":3,"text":"late"})), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -455,10 +525,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_single_use_and_replay_rejected() {
+    async fn submit_retries_are_idempotent() {
         let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, _, write) = open_session(state.clone()).await;
-        let body = Some(json!({"text":"first"}));
+        let body = Some(json!({"sequence":1,"text":"first"}));
         let (status, _) = public_post(
             state.clone(),
             "/api/capture/submit",
@@ -476,7 +546,7 @@ mod tests {
             Some("https://capture.test"),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::OK);
         let (status, _) = public_post(
             state.clone(),
             "/api/capture/connect",
@@ -485,7 +555,7 @@ mod tests {
             Some("https://capture.test"),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -497,7 +567,7 @@ mod tests {
             ("/api/capture/submit", read.as_str()),
             ("/api/capture/submit", "not-a-token"),
         ] {
-            let body = Some(json!({"text":"x"}));
+            let body = Some(json!({"sequence":1,"text":"x"}));
             let (status, _) = public_post(
                 state.clone(),
                 path,
@@ -554,7 +624,7 @@ mod tests {
     async fn public_requires_matching_origin() {
         let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
         let (_, _, write) = open_session(state.clone()).await;
-        let body = Some(json!({"text":"x"}));
+        let body = Some(json!({"sequence":1,"text":"x"}));
         for origin in ["https://evil.example", "http://capture.test"] {
             let (status, _) = public_post(
                 state.clone(),
@@ -585,7 +655,7 @@ mod tests {
             state.clone(),
             "/api/capture/submit",
             &write,
-            Some(json!({"text": "x".repeat(MAX_TEXT + 1)})),
+            Some(json!({"sequence":1,"text": "x".repeat(MAX_TEXT + 1)})),
             Some("https://capture.test"),
         )
         .await;
@@ -594,7 +664,7 @@ mod tests {
             state.clone(),
             "/api/capture/submit",
             &write,
-            Some(json!({"text":"   "})),
+            Some(json!({"sequence":1,"text":"   "})),
             Some("https://capture.test"),
         )
         .await;

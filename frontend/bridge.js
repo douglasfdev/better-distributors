@@ -1,5 +1,7 @@
 // Browser-only integrations. OCR processes the selected image locally; libraries and
 // language models download from public CDNs. No API keys or image upload required.
+// Exported functions for image selection and OCR processing.
+export { chooseImage, ocrFile, ocrDataUrl };
 let ocrLibrary;
 function loadOcr() {
   if (window.Tesseract) return Promise.resolve(window.Tesseract);
@@ -25,38 +27,311 @@ function loadOcr() {
   return ocrLibrary;
 }
 
-// gallery=false (camera) keeps the original behavior; gallery=true opens the file picker without capture.
-function chooseImage(gallery) {
+/** Simple helper returning the provided File (for compatibility) */
+async function ocrFile(file) {
+  if (file instanceof File) return file;
+  throw new Error('Invalid file');
+}
+
+/** Convert a File/Blob to a Data URL */
+async function ocrDataUrl(file) {
   return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/* --------------------------------------------------------------------------
+ * Helpers for image editing – rotate, crop and simple preview UI
+ * -------------------------------------------------------------------------- */
+
+/** Load a File/Blob into an HTMLImageElement */
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    img.src = url;
+  });
+}
+
+/** Rotate a image file by a given angle (in degrees, multiples of 90 for simplicity) */
+export async function rotateImage(file, angleDeg) {
+  const img = await loadImage(file);
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const rad = (angleDeg % 360) * Math.PI / 180;
+  // suportamos apenas rotações de 90° para simplificar
+if (Math.abs(angleDeg % 180) === 90) {
+    canvas.width = img.height;
+    canvas.height = img.width;
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(img, -img.width / 2, -img.height / 2);
+  } else {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(img, -img.width / 2, -img.height / 2);
+  }
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => {
+      resolve(new File([blob], file.name, { type: blob.type }));
+    }, file.type || 'image/jpeg');
+  });
+}
+
+/** Crop a image file to a rectangle {x, y, w, h} (coordinates in original image space) */
+export async function cropImage(file, rect) {
+  const img = await loadImage(file);
+  const canvas = document.createElement('canvas');
+  canvas.width = rect.w;
+  canvas.height = rect.h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => {
+      resolve(new File([blob], file.name, { type: blob.type }));
+    }, file.type || 'image/jpeg');
+  });
+}
+
+const MAX_IMAGE_PIXELS = 25_000_000;
+const MAX_IMAGE_DIMENSION = 10_000;
+function exceedsImageResolution(width, height) {
+  return width * height > MAX_IMAGE_PIXELS || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION;
+}
+
+function editImage(file) {
+  return new Promise((resolve, reject) => {
+    const previousFocus = document.activeElement;
+    const overflow = document.body.style.overflow;
+    const listeners = new AbortController();
+    const dialog = document.createElement('dialog');
+    dialog.id = 'image-editor-overlay';
+    dialog.setAttribute('aria-label', 'Editar imagem');
+    dialog.style.cssText = 'box-sizing:border-box;width:min(96vw,900px);max-height:96dvh;overflow:auto;border:0;border-radius:12px;padding:16px;background:#fff;color:#183e32;';
+    const hint = document.createElement('p');
+    hint.id = 'image-editor-hint';
+    hint.textContent = 'Arraste na imagem para selecionar o recorte. Rotacionar mantém a seleção. Confirmar envia apenas a área selecionada.';
+    const canvas = document.createElement('canvas');
+    canvas.id = 'image-editor-canvas';
+    canvas.setAttribute('aria-label', 'Selecionar recorte');
+    canvas.setAttribute('aria-describedby', hint.id);
+    canvas.style.cssText = 'display:block;margin:auto;max-width:100%;max-height:55dvh;width:auto;height:auto;touch-action:none;cursor:crosshair;';
+    const status = document.createElement('p');
+    status.setAttribute('role', 'status');
+    status.textContent = 'Carregando imagem…';
+    const bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;justify-content:center;';
+    function button(text) {
+      const element = document.createElement('button');
+      element.type = 'button';
+      element.textContent = text;
+      element.style.cssText = 'min-height:44px;padding:8px 12px;border:0;border-radius:6px;background:#183e32;color:white;font:inherit;touch-action:manipulation;';
+      bar.append(element);
+      return element;
+    }
+    const rotate = button('Rotacionar 90°');
+    const reset = button('Redefinir recorte');
+    const confirm = button('Confirmar');
+    const cancel = button('Cancelar');
+    dialog.append(hint, canvas, status, bar);
+    let img;
+    let angle = 0;
+    let selection;
+    let drag;
+    let finished = false;
+    let encoding = false;
+    const source = document.createElement('canvas');
+    const on = (element, event, handler) => element.addEventListener(event, handler, { signal: listeners.signal });
+    function finish(error, result) {
+      if (finished) return;
+      finished = true;
+      listeners.abort();
+      if (drag && canvas.hasPointerCapture(drag.id)) canvas.releasePointerCapture(drag.id);
+      dialog.close();
+      dialog.remove();
+      document.body.style.overflow = overflow;
+      previousFocus?.focus({ preventScroll: true });
+      if (error) reject(error); else resolve(result);
+    }
+    const cancelEdit = () => finish(new Error('Edição de imagem cancelada.'));
+    function controls() {
+      rotate.disabled = reset.disabled = !img || encoding || !!drag;
+      confirm.disabled = !img || encoding || !!drag;
+    }
+    function draw() {
+      const ctx = canvas.getContext('2d');
+      canvas.width = source.width;
+      canvas.height = source.height;
+      ctx.drawImage(source, 0, 0);
+      const { x, y, w, h } = selection;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.beginPath();
+      ctx.rect(0, 0, canvas.width, canvas.height);
+      ctx.rect(x, y, w, h);
+      ctx.fill('evenodd');
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = Math.max(2, source.width / 300);
+      ctx.strokeRect(x, y, w, h);
+      status.textContent = `Recorte: ${w} × ${h} px`;
+      controls();
+    }
+    function renderSource() {
+      source.width = angle % 180 ? img.naturalHeight : img.naturalWidth;
+      source.height = angle % 180 ? img.naturalWidth : img.naturalHeight;
+      const ctx = source.getContext('2d');
+      ctx.translate(source.width / 2, source.height / 2);
+      ctx.rotate(angle * Math.PI / 180);
+      ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    }
+    function point(event) {
+      const bounds = canvas.getBoundingClientRect();
+      return {
+        x: Math.round(Math.max(0, Math.min(source.width, (event.clientX - bounds.left) * source.width / bounds.width))),
+        y: Math.round(Math.max(0, Math.min(source.height, (event.clientY - bounds.top) * source.height / bounds.height)))
+      };
+    }
+    function update(event) {
+      const end = point(event);
+      const x = Math.min(drag.start.x, end.x);
+      const y = Math.min(drag.start.y, end.y);
+      const w = Math.abs(end.x - drag.start.x);
+      const h = Math.abs(end.y - drag.start.y);
+      selection = w && h ? { x, y, w, h } : drag.previous;
+      draw();
+    }
+    on(canvas, 'pointerdown', event => {
+      if (!img || encoding || drag || !event.isPrimary || event.button !== 0) return;
+      event.preventDefault();
+      drag = { id: event.pointerId, start: point(event), previous: selection };
+      canvas.setPointerCapture(event.pointerId);
+      controls();
+    });
+    on(canvas, 'pointermove', event => {
+      if (drag?.id === event.pointerId) update(event);
+    });
+    on(canvas, 'pointerup', event => {
+      if (drag?.id !== event.pointerId) return;
+      update(event);
+      drag = undefined;
+      canvas.releasePointerCapture(event.pointerId);
+      controls();
+    });
+    const abortDrag = event => {
+      if (drag?.id !== event.pointerId) return;
+      selection = drag.previous;
+      drag = undefined;
+      draw();
+    };
+    on(canvas, 'pointercancel', abortDrag);
+    on(canvas, 'lostpointercapture', abortDrag);
+    on(rotate, 'click', () => {
+      const { x, y, w, h } = selection;
+      selection = { x: source.height - y - h, y: x, w: h, h: w };
+      angle = (angle + 90) % 360;
+      renderSource();
+      draw();
+    });
+    on(reset, 'click', () => {
+      selection = { x: 0, y: 0, w: source.width, h: source.height };
+      draw();
+    });
+    on(confirm, 'click', () => {
+      if (encoding || !img || drag) return;
+      encoding = true;
+      controls();
+      try {
+        const output = document.createElement('canvas');
+        const { x, y, w, h } = selection;
+        if (exceedsImageResolution(w, h)) return finish(new Error('A imagem deve ter no máximo 25 milhões de pixels e 10000 pixels por dimensão. Escolha uma foto menor.'));
+        output.width = w;
+        output.height = h;
+        output.getContext('2d').drawImage(source, x, y, w, h, 0, 0, w, h);
+        output.toBlob(blob => {
+          if (finished) return;
+          if (!blob) return finish(new Error('Não foi possível preparar a imagem. Tente novamente.'));
+          finish(null, new File([blob], file.name, { type: blob.type }));
+        }, file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png', 0.95);
+      } catch (_) { finish(new Error('Não foi possível preparar a imagem. Tente novamente.')); }
+    });
+    on(cancel, 'click', cancelEdit);
+    on(dialog, 'cancel', event => { event.preventDefault(); cancelEdit(); });
+    on(dialog, 'close', cancelEdit);
+    on(window, 'pagehide', cancelEdit);
+    controls();
+    try {
+      document.body.append(dialog);
+      document.body.style.overflow = 'hidden';
+      dialog.showModal();
+      cancel.focus();
+      loadImage(file).then(image => {
+        if (finished) return;
+        if (exceedsImageResolution(image.naturalWidth, image.naturalHeight)) return finish(new Error('A imagem deve ter no máximo 25 milhões de pixels e 10000 pixels por dimensão. Escolha uma foto menor.'));
+        img = image;
+        renderSource();
+        selection = { x: 0, y: 0, w: source.width, h: source.height };
+        draw();
+      }).catch(() => finish(new Error('Não foi possível abrir a imagem. Escolha uma foto válida.')));
+    } catch (error) { finish(error); }
+  });
+}
+
+async function chooseImage(gallery) {
+  const file = await new Promise((resolve, reject) => {
     const input = document.createElement('input');
+    const listeners = new AbortController();
     input.type = 'file';
     input.accept = 'image/*';
     if (!gallery) input.setAttribute('capture', 'environment');
-    // Use opacity/position instead of display:none so mobile browsers allow the click
-    input.style.cssText = 'position:fixed;top:0;left:0;opacity:0;width:100%;height:100%;';
+    input.hidden = true;
     document.body.append(input);
-    function cleanup() { input.remove(); }
-    input.addEventListener('cancel', () => {
-      cleanup();
-      reject(new Error('Seleção de imagem cancelada.'));
-    }, { once: true });
-    input.addEventListener('change', () => {
-      const file = input.files?.[0];
-      cleanup();
-      if (!file) return reject(new Error('Seleção de imagem cancelada.'));
-      if (!file.type.startsWith('image/')) return reject(new Error('Selecione um arquivo de imagem válido.'));
-      if (!file.size) return reject(new Error('A imagem está vazia. Escolha outro arquivo.'));
-      if (file.size > 12 * 1024 * 1024) return reject(new Error('A imagem deve ter no máximo 12 MB.'));
-      resolve(file);
-    }, { once: true });
-    // Must click in the same event loop as user gesture
-    try {
-        input.click();
-    } catch (_) {
-        cleanup();
-        reject(new Error('Não foi possível abrir a câmera ou a galeria neste navegador.'));
+    function finish(error, selected) {
+      listeners.abort();
+      input.remove();
+      if (error) reject(error); else resolve(selected);
     }
+    input.addEventListener('cancel', () => finish(new Error('Seleção de imagem cancelada.')), { signal: listeners.signal });
+    input.addEventListener('change', () => {
+      const selected = input.files?.[0];
+      if (!selected) return finish(new Error('Seleção de imagem cancelada.'));
+      finish(null, selected);
+    }, { signal: listeners.signal });
+    window.addEventListener('pagehide', () => finish(new Error('Seleção de imagem cancelada.')), { signal: listeners.signal });
+    try { input.click(); }
+    catch (_) { finish(new Error('Não foi possível abrir a câmera ou a galeria neste navegador.')); }
   });
+  if (!file.type.startsWith('image/')) throw new Error('Selecione um arquivo de imagem válido.');
+  if (!file.size) throw new Error('A imagem está vazia. Escolha outro arquivo.');
+  if (file.size > 12 * 1024 * 1024) throw new Error('A imagem deve ter no máximo 12 MB.');
+  return editImage(file);
+}
+
+// Locate functionality – provides geolocation with proper error messages.
+
+export async function locate() {
+  if (!window.isSecureContext) throw new Error('A localização exige HTTPS ou acesso por localhost.');
+  if (!navigator.geolocation) throw new Error('Este navegador não oferece localização. Informe as coordenadas manualmente.');
+  return new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(
+    ({ coords }) => resolve(JSON.stringify({ latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy })),
+    (error) => reject(new Error({
+      1: 'Permissão de localização negada. Autorize o acesso nas configurações do navegador.',
+      2: 'Localização indisponível. Verifique o GPS e tente novamente.',
+      3: 'Tempo esgotado ao buscar localização. Tente novamente em uma área aberta.'
+    }[error.code] || 'Não foi possível obter sua localização.')),
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+  ));
 }
 
 // Live streams cannot be seeked. Let the user frame and confirm a decoded frame.
@@ -161,31 +436,15 @@ async function scanImageImpl(gallery) {
 async function captureCameraFile() {
   const blob = await captureCamera();
   // Cria um File para manter a mesma API que chooseImage() devolve.
-  return new File([blob], 'camera.jpg', { type: blob.type || 'image/jpeg' });
+  return editImage(new File([blob], 'camera.jpg', { type: blob.type || 'image/jpeg' }));
 }
 
 
-async function locateImpl() {
-  if (!window.isSecureContext) throw new Error('A localização exige HTTPS ou acesso por localhost.');
-  if (!navigator.geolocation) throw new Error('Este navegador não oferece localização. Informe as coordenadas manualmente.');
-  return new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(
-    ({ coords }) => resolve(JSON.stringify({ latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy })),
-    error => reject(new Error({
-      1: 'Permissão de localização negada. Autorize o acesso nas configurações do navegador.',
-      2: 'Localização indisponível. Verifique o GPS e tente novamente.',
-      3: 'Tempo esgotado ao buscar localização. Tente novamente em uma área aberta.'
-    }[error.code] || 'Não foi possível obter sua localização.')),
-    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
-  ));
-}
 
 // Rust's JsValue::as_string reads rejected strings, not Error objects.
 // gallery is an optional boolean: scanImage() and scanImage(false) use the camera-capture selector.
 export async function scanImage(gallery) {
   try { return await scanImageImpl(gallery === true); } catch (error) { throw error?.message || String(error); }
-}
-export async function locate() {
-  try { return await locateImpl(); } catch (error) { throw error?.message || String(error); }
 }
 export function showMap(storesJson) {
   try { return showMapImpl(storesJson); } catch (error) { throw error?.message || String(error); }

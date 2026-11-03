@@ -10,11 +10,10 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::window;
 
 const POLL_INTERVAL_MS: i32 = 2_000;
-const SLICE_MS: i32 = 100;
 const REQUEST_TIMEOUT_MS: i32 = 10_000;
 
-#[derive(Clone)]
-struct Session {
+#[derive(Clone, PartialEq)]
+pub struct Session {
     id: String,
     read_token: String,
     url: String,
@@ -74,6 +73,7 @@ async fn poll_once(
     countdown: RwSignal<i64>,
 ) -> PollOutcome {
     match response.status() {
+        401 => PollOutcome::Expired,
         code if code != 200 => {
             error.set(api_error(code, "A leitura do status falhou. Tentando de novo…"));
             PollOutcome::Continue
@@ -95,11 +95,11 @@ async fn poll_once(
                     status.set("connected");
                     PollOutcome::Continue
                 }
-                Some("expired") => PollOutcome::Expired,
+                Some("expired" | "ended") => PollOutcome::Expired,
                 Some("received") => {
                     // Suggestion only: feeds the review field for manual
                     // application. Never saved, never applied automatically.
-                    PollOutcome::Received(body["text"].as_str().unwrap_or("").to_owned())
+                    PollOutcome::Received(body["text"].as_str().unwrap_or("").to_owned(), body["sequence"].as_u64().unwrap_or(0))
                 }
                 other => {
                     error.set(format!(
@@ -115,7 +115,7 @@ async fn poll_once(
 
 enum PollOutcome {
     Continue,
-    Received(String),
+    Received(String, u64),
     Expired,
 }
 
@@ -126,11 +126,13 @@ fn poll(
     error: RwSignal<String>,
     countdown: RwSignal<i64>,
     open: RwSignal<bool>,
-    session_rw: RwSignal<Option<Session>>,
+    _session_rw: RwSignal<Option<Session>>,
     generation: RwSignal<u32>,
     ocr: RwSignal<String>,
+    pending: RwSignal<Option<(Session, u64)>>,
 ) {
     spawn_local(async move {
+        let mut received_sequence = 0;
         loop {
             if generation.get() != my_generation || !open.get() {
                 return;
@@ -161,18 +163,17 @@ fn poll(
                             // Stop polling; show the expired state and keep the
                             // session for manual cancel/regenerate.
                             status.set("expired");
+                            pending.set(None);
                             generation.update(|g| *g += 1);
                             return;
                         }
-                        PollOutcome::Received(text) => {
-                            // Stop polling; panel closes and the text waits in
-                            // the review field for the user's manual decision.
-                            status.set("");
-                            generation.update(|g| *g += 1);
-                            session_rw.set(None);
-                            open.set(false);
-                            ocr.set(text);
-                            return;
+                        PollOutcome::Received(text, sequence) => {
+                            if sequence > received_sequence {
+                                received_sequence = sequence;
+                                pending.set(Some((session.clone(), sequence)));
+                                ocr.set(text);
+                            }
+                            status.set("review");
                         }
                     }
                 }
@@ -188,12 +189,7 @@ fn poll(
                 }
             }
             // Sleep in slices so cancel/close/regenerate take effect at once.
-            for _ in 0..(POLL_INTERVAL_MS / SLICE_MS) {
-                if generation.get() != my_generation || !open.get() {
-                    return;
-                }
-                let _ = sleep(SLICE_MS).await;
-            }
+            let _ = sleep(POLL_INTERVAL_MS).await;
             countdown.set(remaining_seconds(&session.expires_at));
         }
     });
@@ -207,6 +203,7 @@ fn start_capture(
     open: RwSignal<bool>,
     countdown: RwSignal<i64>,
     ocr: RwSignal<String>,
+    pending: RwSignal<Option<(Session, u64)>>,
 ) {
     spawn_local(async move {
         // Invalidate any previous polling loop before touching signals.
@@ -252,6 +249,7 @@ fn start_capture(
                             session,
                             generation,
                             ocr,
+                            pending,
                         );
                     }
                     Err(_) => {
@@ -282,8 +280,22 @@ fn start_capture(
     });
 }
 
+pub async fn acknowledge(session: Session, sequence: u64) -> Result<(), String> {
+    loop {
+        let response = Request::post(&format!("/api/captures/{}/ack", session.id))
+            .header("Authorization", &format!("Bearer {}", session.read_token))
+            .json(&serde_json::json!({"sequence": sequence})).map_err(|e| e.to_string())?
+            .send().await;
+        match response {
+            Ok(response) if response.ok() => return Ok(()),
+            Ok(response) if response.status() < 500 => return Err("Sessão encerrada ou expirada. Gere outro QR para continuar.".into()),
+            _ => { let _ = sleep(POLL_INTERVAL_MS).await; }
+        }
+    }
+}
+
 #[component]
-pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
+pub fn CapturePanel(ocr: RwSignal<String>, pending: RwSignal<Option<(Session, u64)>>) -> impl IntoView {
     let open = RwSignal::new(false);
     let session = RwSignal::new(None::<Session>);
     let status = RwSignal::new("");
@@ -308,7 +320,7 @@ pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
     // Signal captures are Copy, so these handlers stay cheap Fn closures
     // (and there is nothing shared or cloned across the view tree).
     let start_action = move || {
-        start_capture(session, status, error, generation, open, countdown, ocr);
+        start_capture(session, status, error, generation, open, countdown, ocr, pending);
     };
     let start_click = move |_| start_action();
 
@@ -329,6 +341,7 @@ pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
             cancel_session(&current);
             session.set(None);
         }
+        pending.set(None);
         status.set("");
         start_action();
     };
@@ -343,6 +356,7 @@ pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
             cancel_session(&current);
         }
         session.set(None);
+        pending.set(None);
     };
 
     view! {
@@ -362,6 +376,9 @@ pub fn CapturePanel(ocr: RwSignal<String>) -> impl IntoView {
                     <span class="badge">"CAPTURA PELO CELULAR"</span>
                     <button class="icon-button" type="button" aria-label="Fechar captura" on:click=close_click>"×"</button>
                 </div>
+                <Show when=move || status.get() == "review">
+                    <p role="status">"Texto recebido. Revise e salve a loja para liberar a próxima captura no celular."</p>
+                </Show>
                 <Show when=move || !error.get().is_empty()>
                     <p class="capture-error" role="alert">{move || error.get()}</p>
                 </Show>

@@ -1,0 +1,36 @@
+name: better-distributors
+
+services:
+  app:
+    image: ${APP_IMAGE:?Set APP_IMAGE to the release image}
+    pull_policy: never
+    restart: unless-stopped
+    user: "10001:10001"
+    env_file:
+      - .env.production
+    environment:
+      DATABASE_URL: sqlite:///data/distributors.db?mode=rwc
+      BIND_ADDR: 0.0.0.0:3000
+      CAPTURE_BIND_ADDR: 0.0.0.0:3001
+      FRONTEND_DIST: /app/frontend/dist
+      CAPTURE_FRONTEND_DIR: /app/frontend
+      CAPTURE_ALLOW_HTTP: "0"
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "5", "http://127.0.0.1:3000/api/stores"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  data:
+    name: better-distributors-data

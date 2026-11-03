@@ -53,7 +53,7 @@
 
       <div id="state-invalid">
         <h1>Link de captura inválido</h1>
-        <p class="muted">Este link é usado uma única vez e junto do computador. Volte lá, gere um novo QR e aponte a câmera para ele.</p>
+        <p class="muted">Esta sessão é usada junto do computador e vale por 15 minutos. Volte lá, gere um novo QR e aponte a câmera para ele.</p>
       </div>
 
       <div id="state-connecting" class="hidden">
@@ -90,9 +90,11 @@
 
       <div id="state-done" class="hidden">
         <h1>Texto enviado ✔</h1>
-        <p class="muted">Revise e aplique os dados direto no computador. Pode fechar esta página.</p>
+        <p class="muted">Aguardando o computador revisar e salvar a loja. A próxima captura será liberada após salvar.</p>
       </div>
 
+      <div id="state-ended" class="hidden"><h1>Sessão encerrada</h1><p>Você pode fechar esta página. Para continuar, gere um novo QR no computador.</p></div>
+      <button class="secondary hidden" id="btn-end" type="button">Encerrar sessão</button>
       <div id="alert" class="hidden" role="alert" style="margin-top: 12px;"></div>
     </section>
     <footer>Nesta sessão o texto só circula entre seu celular e seu computador.</footer>
@@ -103,13 +105,60 @@
 
     const els = Object.fromEntries(
       ['state-invalid','state-connecting','state-ready','state-sending','state-done','btn-camera',
-       'btn-gallery','btn-paste','scan-status','review','text','btn-discard','btn-send','alert']
+       'btn-gallery','btn-paste','scan-status','review','text','btn-discard','btn-send','alert','state-ended','btn-end']
       .map(id => [id, document.getElementById(id)])
     );
 
     // The write token lives only in memory. showState() drives the page flow.
     let token = '';
     let submitted = false;
+    let sequence = 1;
+    let ended = false;
+    let sending = false;
+    let polling;
+    function finish() {
+      ended = true;
+      clearTimeout(polling);
+      window.dispatchEvent(new Event('pagehide'));
+      showState('state-ended');
+      els['btn-end'].classList.add('hidden');
+      clearAlert();
+    }
+    async function pollStatus() {
+      if (ended) return;
+      try {
+        const response = await request('/api/capture/status', { method: 'POST' });
+        if (ended) return;
+        if (response.status === 401) { finish(); return; }
+        if (!response.ok) throw new Error('Sem conexão. Tentando novamente…');
+        const body = await response.json();
+        if (body.status === 'ended') { finish(); return; }
+        if (!sending && body.status === 'received') {
+          submitted = true;
+          showState('state-done');
+        } else if (!sending && body.sequence > sequence) {
+          sequence = body.sequence;
+          submitted = false;
+          els.text.value = '';
+          els.review.classList.add('hidden');
+          els['btn-send'].disabled = false;
+          els['btn-camera'].disabled = false;
+          els['btn-gallery'].disabled = false;
+          clearAlert();
+          showState('state-ready');
+        }
+      } catch (error) { if (!ended) alert(error.message, false); }
+      if (!ended) polling = setTimeout(pollStatus, 1000);
+    }
+    els['btn-end'].addEventListener('click', async () => {
+      els['btn-end'].disabled = true;
+      try {
+        const response = await request('/api/capture/end', { method: 'POST' });
+        if (!response.ok && response.status !== 401) throw new Error('Não foi possível encerrar. Tente novamente.');
+        finish();
+      } catch (error) { alert(error.message, false); }
+      finally { els['btn-end'].disabled = false; }
+    });
 
     function alert(message, ok) {
       els.alert.classList.remove('hidden', 'ok', 'error');
@@ -118,7 +167,7 @@
     }
     function clearAlert() { els.alert.classList.add('hidden'); }
     function showState(name) {
-      for (const id of ['state-invalid','state-connecting','state-ready','state-sending','state-done']) {
+      for (const id of ['state-invalid','state-connecting','state-ready','state-sending','state-done','state-ended']) {
         els[id].classList.toggle('hidden', id !== name);
       }
     }
@@ -164,6 +213,7 @@
     }
 
     function review(text) {
+      if (ended || submitted) return;
       els.text.value = text.trim().slice(0, 32000);
       els.review.classList.remove('hidden');
       els['btn-send'].focus();
@@ -217,14 +267,18 @@
       clearAlert();
       const text = els.text.value.trim();
       if (!text) { alert('Escreva o texto antes de enviar.', false); return; }
+      if (ended || submitted || sending) return;
+      sending = true;
       showState('state-sending');
       try {
         const response = await request('/api/capture/submit', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, sequence }),
         });
-        if (response.status === 401 || response.status === 403 || response.status === 409) {
+        if (ended) return;
+        if (response.status === 401) { finish(); return; }
+        if (response.status === 403 || response.status === 409) {
           const raw = await response.json().then(b => b.error).catch(() => null);
           showState('state-invalid');
           alert(raw || 'Esta captura não é mais válida. Gere um novo QR no computador.', false);
@@ -235,9 +289,8 @@
         els['btn-send'].disabled = true;
         showState('state-done');
       } catch (error) {
-        showState('state-ready');
-        await handleError(error);
-      }
+        if (!ended) await handleError(error);
+      } finally { sending = false; }
     });
 
     (async () => {
@@ -249,7 +302,13 @@
       try {
         const response = await request('/api/capture/connect', { method: 'POST' });
         if (response.ok) {
-          showState('state-ready');
+          const body = await response.json();
+          if (body.status === 'ended') { finish(); return; }
+          sequence = body.sequence;
+          submitted = body.status === 'received';
+          els['btn-end'].classList.remove('hidden');
+          polling = setTimeout(pollStatus, 1000);
+          showState(submitted ? 'state-done' : 'state-ready');
           els['btn-camera'].focus();
         } else {
           const raw = await response.json().then(b => b.error).catch(() => null);

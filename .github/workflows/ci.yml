@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: cargo install trunk --version 0.21.14 --locked
+      - name: Check bridge syntax
+        run: node --input-type=module --check < frontend/bridge.js
+      - name: Native tests
+        run: cargo test --locked -p distributor-model -p distributor-server
+      - name: WASM check
+        run: cargo check --locked -p distributor-web --target wasm32-unknown-unknown
+      - name: Native Clippy
+        run: cargo clippy --locked -p distributor-model -p distributor-server --all-targets -- -D warnings
+      - name: WASM Clippy
+        run: cargo clippy --locked -p distributor-web --target wasm32-unknown-unknown -- -D warnings -A clippy::too_many_arguments
+      - name: Build frontend
+        working-directory: frontend
+        run: trunk build --release --locked
+      - name: Build backend
+        run: cargo build --locked -p distributor-server
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Capture end-to-end tests
+        shell: bash
+        env:
+          DATABASE_URL: sqlite://${{ runner.temp }}/capture-ci.db?mode=rwc
+          BIND_ADDR: 127.0.0.1:3100
+          FRONTEND_DIST: frontend/dist
+          ALLOWED_HOSTS: localhost,127.0.0.1,[::1]
+          CAPTURE_PUBLIC_URL: http://127.0.0.1:3101
+          CAPTURE_BIND_ADDR: 127.0.0.1:3101
+          CAPTURE_FRONTEND_DIR: frontend
+          CAPTURE_ALLOW_HTTP: '1'
+          CAPTURE_TEST_API: http://127.0.0.1:3100
+          CAPTURE_TEST_URL: http://127.0.0.1:3101
+        run: |
+          set -euo pipefail
+          target/debug/distributor-server > "$RUNNER_TEMP/capture-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          ready=false
+          for attempt in {1..60}; do
+            kill -0 "$server_pid"
+            if curl --fail --silent --show-error --max-time 2 "$CAPTURE_TEST_API/api/stores" > /dev/null &&
+               curl --fail --silent --show-error --max-time 2 "$CAPTURE_TEST_URL/capture" > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          npm run e2e -- --browser=chromium
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-logs
+          path: |
+            ${{ runner.temp }}/capture-server.log
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore

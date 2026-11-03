@@ -1,0 +1,115 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    concurrency:
+      group: better-distributors-production
+      cancel-in-progress: false
+    env:
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+    steps:
+      - name: Reject superseded release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          test "$RELEASE_SHA" = "$current_sha"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: better-distributors:sha-${{ github.event.workflow_run.head_sha }}
+      - name: Package and deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VPS_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$VPS_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          port="${VPS_PORT:-22}"
+          [[ "$port" =~ ^[0-9]{1,5}$ ]]
+          (( 10#$port > 0 && 10#$port <= 65535 ))
+          test -n "$VPS_SSH_KEY"
+          test -n "$VPS_KNOWN_HOSTS"
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"; rm -f "$RUNNER_TEMP/image.tar.gz"' EXIT
+          printf '%s\n' "$VPS_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          opts=(-i "$ssh_dir/key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ssh_dir/known_hosts" -o ConnectTimeout=20)
+          remote="$VPS_USER@$VPS_HOST"
+          release="/opt/better-distributors/releases/$RELEASE_SHA"
+          docker save "better-distributors:sha-$RELEASE_SHA" | gzip -1 > "$RUNNER_TEMP/image.tar.gz"
+          ssh "${opts[@]}" -p "$port" "$remote" "mkdir -p '$release'"
+          scp "${opts[@]}" -P "$port" compose.yml "$RUNNER_TEMP/image.tar.gz" "$remote:$release/"
+          ssh "${opts[@]}" -p "$port" "$remote" "bash -s -- '$RELEASE_SHA'" <<'REMOTE'
+          set -euo pipefail
+          umask 077
+          cd /opt/better-distributors
+          exec 9>.deploy.lock
+          flock -x 9
+          sha="$1"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          release="releases/$sha"
+          test -f .env.production
+          docker compose version
+          gzip -dc "$release/image.tar.gz" | docker load
+          rm -f "$release/image.tar.gz"
+          printf 'APP_IMAGE=better-distributors:sha-%s\n' "$sha" > .env.candidate
+          cp "$release/compose.yml" compose.candidate.yml
+          docker compose --env-file .env.candidate -f compose.candidate.yml config --quiet
+          previous=false
+          if test -f .env.release; then
+            test -f compose.yml
+            cp .env.release .env.previous
+            cp compose.yml compose.previous.yml
+            previous=true
+          fi
+          rollback() {
+            trap - ERR INT TERM
+            if "$previous"; then
+              docker compose --env-file .env.previous -f compose.previous.yml up -d --wait --wait-timeout 120
+              cp compose.previous.yml compose.yml
+              cp .env.previous .env.release
+            else
+              docker compose --env-file .env.candidate -f compose.candidate.yml down
+            fi
+            exit 1
+          }
+          trap rollback ERR INT TERM
+          docker compose --env-file .env.candidate -f compose.candidate.yml up -d --wait --wait-timeout 120
+          cp compose.candidate.yml compose.yml
+          mv .env.candidate .env.release
+          trap - ERR INT TERM
+          rm -f compose.candidate.yml
+          REMOTE

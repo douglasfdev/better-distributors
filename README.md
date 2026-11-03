@@ -104,7 +104,9 @@ cloudflared tunnel --url http://127.0.0.1:3001
 cargo run -p distributor-server
 ```
 
-O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos, permite um único envio e não expõe lojas, painel nem a foto do cartão — o OCR roda no próprio navegador.
+O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos (prazo absoluto) e permite várias capturas, uma por vez. Depois de enviar, o celular aguarda o PC revisar e **salvar com sucesso**; só então uma confirmação libera a próxima captura na mesma página. Falhas de salvamento não liberam o celular. Use **Encerrar sessão** no celular ou **Fechar captura** no PC; a página mostra o encerramento sem depender de `window.close()`. Não são expostos lojas, painel nem a foto do cartão — o OCR roda no próprio navegador.
+
+O protocolo usa polling, sem WebSocket: token de escrita somente no bridge público, token de leitura/confirmação somente no painel local. Cada envio e confirmação contém uma sequência; reenvio idêntico é idempotente, confirmações antigas não liberam capturas novas, e transições são serializadas no backend. O painel repete confirmações em falhas transitórias após salvar, sem salvar a loja novamente. Sessões ficam em memória e são invalidadas ao reiniciar o servidor; recarregar a página do celular perde o token (removido do endereço por segurança). A confirmação é uma declaração do painel local após resposta de sucesso da API de lojas, não uma transação SQLite conjunta.
 
 ### Alternativa offline (mesma rede, sem túnel)
 
@@ -117,6 +119,57 @@ CAPTURE_BIND_ADDR=0.0.0.0:3001
 ```
 
 Libere a porta 3001 no firewall do Windows (rede privada). Nesse modo, **a câmera usa o app nativo do celular** e a digitação manual (“Colar texto”) funciona sem internet; o OCR da foto precisa de internet no celular para baixar o leitor. HTTP local é para teste/diário em rede confiável — para produção, prefira o túnel HTTPS.
+
+## Deploy Docker no VPS
+
+O workflow separado `Deploy` executa somente após `CI` concluir com sucesso em um push de `main` deste repositório. O checkout usa o `head_sha` testado, e o Buildx produz `linux/amd64` com tag `better-distributors:sha-<SHA completo>`, sem `latest`. A imagem é exportada com `docker save`, comprimida e transferida por SSH; não há push ao GHCR, token de registry nem permissão `packages: write`. Novos deploys aguardam o deploy em andamento, sem cancelá-lo. Reexecuções do mesmo SHA podem reconstruir dependências de sistema diferentes, pois Rust stable e as imagens base acompanham atualizações; para repetir exatamente um release, preserve sua imagem local.
+
+### Preparação do servidor
+
+Use um VPS Linux amd64 com Docker Engine e o plugin Docker Compose v2 com suporte a `up --wait`, além de Bash, gzip e flock (util-linux). Instale Docker pelo procedimento oficial da distribuição antes do primeiro deploy. O usuário de deploy precisa executar `docker` sem sudo (acesso ao grupo Docker equivale a root). Crie `/opt/better-distributors`, de propriedade desse usuário, com permissão `0700`. Reserve espaço para compilação no runner e, no VPS, para o arquivo comprimido, a imagem nova, a anterior e o banco; monitore disco e logs do Docker.
+
+Crie manualmente `/opt/better-distributors/.env.production` com permissão `0600`, sem versioná-lo nem enviá-lo como artifact. Exemplo (substitua o domínio de captura):
+
+```dotenv
+ALLOWED_HOSTS=localhost,127.0.0.1,[::1]
+CAPTURE_PUBLIC_URL=https://capture.example.com
+```
+
+O Compose fixa os binds internos em `0.0.0.0:3000` e `0.0.0.0:3001`, os caminhos dos assets e `DATABASE_URL=sqlite:///data/distributors.db?mode=rwc`; não tente sobrescrevê-los no arquivo. HTTP de captura é desativado. Inclua `127.0.0.1` em `ALLOWED_HOSTS` para o healthcheck e adicione o hostname de qualquer proxy privado autorizado. O volume nomeado `better-distributors-data` recebe `/data` com proprietário UID/GID `10001:10001` na primeira criação. Volumes existentes precisam dessa propriedade corrigida antes do deploy. O processo roda sem root, com certificados CA e curl instalados.
+
+### GitHub e SSH
+
+Crie o environment **production**, preferencialmente com aprovação obrigatória e restrição à branch `main`, e configure estes secrets nele:
+
+| Secret | Conteúdo |
+|---|---|
+| `VPS_HOST` | Hostname ou IPv4 do VPS, sem protocolo ou porta |
+| `VPS_USER` | Usuário de deploy proprietário de `/opt/better-distributors` |
+| `VPS_SSH_KEY` | Chave privada SSH dedicada, sem senha interativa; instale a chave pública no VPS |
+| `VPS_KNOWN_HOSTS` | Linha(s) known_hosts verificadas por canal independente, como o console do provedor |
+| `VPS_PORT` | Opcional; porta SSH, padrão `22` |
+
+Para porta não padrão, known_hosts deve identificar `[host]:porta`. Não confie cegamente no resultado de `ssh-keyscan`; compare o fingerprint com o servidor por canal confiável. O workflow exige verificação estrita, sem aceitar automaticamente chaves novas. Permita SSH dos runners conforme sua política de firewall. O workflow `workflow_run` precisa existir na branch padrão; mantenha `main` como branch padrão e o nome do workflow de validação como `CI`.
+
+### Acesso, saúde e rollback
+
+As duas portas são publicadas **somente em 127.0.0.1 do VPS**. Não abra 3000/3001 no firewall, não publique a API Docker e não crie endpoint público de gerenciamento. Acesse o painel por VPN ou túnel SSH, por exemplo `ssh -L 3000:127.0.0.1:3000 usuario@vps`, abrindo `http://localhost:3000`. Se usar reverse proxy para gerenciamento, mantenha-o privado, com HTTPS, autenticação e autorização obrigatórias: a aplicação não implementa login.
+
+Para celulares, configure um reverse proxy HTTPS no host para encaminhar **somente o serviço de captura** a `127.0.0.1:3001`, usando a origem de `CAPTURE_PUBLIC_URL`. Nunca encaminhe esse domínio para 3000. Configure limites de requisições e tamanho, TLS e controles de acesso apropriados; preserve o protocolo HTTPS e teste o fluxo QR real. Não há endpoint de deploy ou administração exposto pela aplicação.
+
+O deploy carrega a imagem localmente, valida o Compose e aguarda o healthcheck `GET /api/stores`. `.env.release` guarda `APP_IMAGE` do release ativo; `.env.previous` e `compose.previous.yml` preservam o anterior. Se a atualização falhar, o workflow tenta restaurar a imagem e o Compose anteriores e termina com erro; no primeiro deploy, remove os containers sem apagar o volume. Falhas de SSH/energia podem exigir intervenção manual. Para rollback manual, execute na pasta `/opt/better-distributors`:
+
+```bash
+docker compose --env-file .env.previous -f compose.previous.yml up -d --wait --wait-timeout 120
+cp compose.previous.yml compose.yml
+cp .env.previous .env.release
+```
+
+Não remova a imagem anterior com `docker image prune -a`; retenha pelo menos as imagens referenciadas em `.env.release` e `.env.previous`. As transferências ficam em `releases/<SHA>`; o arquivo comprimido é removido após `docker load`. Revise e limpe releases antigos conforme a política de retenção. O rollback de imagem **não desfaz migrações nem alterações no SQLite**.
+
+### Backup e recuperação
+
+Antes de atualizar versões com alterações no banco, pare o serviço com `docker compose --env-file .env.release stop app`, faça backup de todo o volume `better-distributors-data` (incluindo eventuais arquivos WAL/SHM), e reinicie com `docker compose --env-file .env.release up -d --wait`. Use ferramenta de backup de volumes ou container auxiliar confiável com o volume montado somente para leitura enquanto o serviço está parado. Mantenha backups criptografados fora do VPS, defina retenção e teste a restauração com UID/GID `10001:10001`. Nunca execute `docker compose down -v` em produção. Imagens Docker e rollback não são backup dos dados.
 
 ## Estrutura
 
