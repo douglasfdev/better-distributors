@@ -63,7 +63,7 @@
 
       <div id="state-ready" class="hidden">
         <h1>Captura conectada</h1>
-        <p class="muted">Fotografe o cartão ou escolha uma imagem. O texto é lido <strong>neste aparelho</strong>; nada é enviado antes de você revisar e confirmar.</p>
+        <p class="muted">Fotografe ou escolha uma imagem e confirme o recorte. OCR local por padrão; se habilitado, você poderá autorizar o envio ao Google Gemini ou escolher leitura local. Revise o texto antes de enviar ao computador.</p>
         <div class="actions">
           <button class="primary" id="btn-camera" type="button">📷 Fotografia</button>
           <button class="secondary" id="btn-gallery" type="button">🖼️ Galeria</button>
@@ -97,7 +97,7 @@
       <button class="secondary hidden" id="btn-end" type="button">Encerrar sessão</button>
       <div id="alert" class="hidden" role="alert" style="margin-top: 12px;"></div>
     </section>
-    <footer>Nesta sessão o texto só circula entre seu celular e seu computador.</footer>
+    <footer>Nada é salvo automaticamente. OCR Google opcional envia a imagem editada para processamento externo.</footer>
   </main>
 
   <script type="module">
@@ -230,12 +230,12 @@
       const scanStatus = els['scan-status'];
       scanStatus.classList.remove('hidden', 'ok', 'error');
       scanStatus.setAttribute('role', 'status');
-      scanStatus.textContent = 'Lendo a imagem neste aparelho…';
+      scanStatus.textContent = 'Preparando leitura da imagem…';
       els['btn-camera'].disabled = true;
       els['btn-gallery'].disabled = true;
       try {
         // Keep the picker inside the original click's user activation.
-        const text = await scanImage(gallery);
+        const text = await scanImage(gallery, { token, sequence });
         scanStatus.classList.add('hidden');
         review(text);
       } catch (error) {

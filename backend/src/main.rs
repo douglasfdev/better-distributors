@@ -10,6 +10,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 mod capture;
+mod ocr;
 pub use crate::capture::{Captures, local_router, public_router};
 fn error(status: StatusCode, message: &str) -> ApiError {
     (status, Json(serde_json::json!({"error": message})))

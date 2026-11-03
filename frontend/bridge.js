@@ -1,6 +1,3 @@
-// Browser-only integrations. OCR processes the selected image locally; libraries and
-// language models download from public CDNs. No API keys or image upload required.
-// Exported functions for image selection and OCR processing.
 export { chooseImage, ocrFile, ocrDataUrl };
 let ocrLibrary;
 function loadOcr() {
@@ -412,10 +409,43 @@ function captureCamera() {
   });
 }
 
-async function scanImageImpl(gallery) {
+async function cloudOcr(file, options) {
+  const phone = !!options?.token;
+  const path = phone ? '/api/capture/ocr' : '/api/ocr';
+  const headers = phone ? { authorization: `Bearer ${options.token}`, 'x-capture-sequence': String(options.sequence) } : { 'x-ocr-request': '1' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const config = await fetch(`${path}/config`, { headers, signal: controller.signal, cache: 'no-store', redirect: 'error' });
+    if (phone && [401, 403, 409].includes(config.status)) return null;
+    if (!config.ok) throw new Error('Falha ao consultar o OCR na nuvem.');
+    if ((await config.json()).enabled !== true) return null;
+    const img = await loadImage(file);
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(1, 2048 / Math.max(img.naturalWidth, img.naturalHeight));
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+    if (!blob || blob.size > 4 * 1024 * 1024) return null;
+    const response = await fetch(path, { method: 'POST', headers: { ...headers, 'content-type': 'image/jpeg' }, body: blob, signal: controller.signal, redirect: 'error' });
+    if (!response.ok) return null;
+    const result = await response.json();
+    return typeof result.text === 'string' && result.text.trim() && result.text.length <= 32000 ? result.text.trim() : null;
+  } catch (error) {
+    return null;
+  } finally { clearTimeout(timer); }
+}
+
+async function scanImageImpl(gallery, options) {
   // Quando gallery===false queremos usar a câmera nativa (getUserMedia) para evitar o seletor de arquivos.
   // Quando gallery===true usamos o seletor de arquivos tradicional.
   const file = gallery ? await chooseImage(true) : await captureCameraFile();
+  const cloudText = options?.local ? null : await cloudOcr(file, options);
+  if (cloudText) return cloudText;
   const Tesseract = await loadOcr();
   let worker;
   try {
@@ -443,8 +473,8 @@ async function captureCameraFile() {
 
 // Rust's JsValue::as_string reads rejected strings, not Error objects.
 // gallery is an optional boolean: scanImage() and scanImage(false) use the camera-capture selector.
-export async function scanImage(gallery) {
-  try { return await scanImageImpl(gallery === true); } catch (error) { throw error?.message || String(error); }
+export async function scanImage(gallery, options) {
+  try { return await scanImageImpl(gallery === true, options); } catch (error) { throw error?.message || String(error); }
 }
 export function showMap(storesJson) {
   try { return showMapImpl(storesJson); } catch (error) { throw error?.message || String(error); }

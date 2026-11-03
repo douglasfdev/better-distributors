@@ -364,3 +364,76 @@ test('OCR failure displays status and releases worker; next selection succeeds',
   await expect(page.locator('#text')).toHaveValue('TEST OCR RESULT');
   await expect(page.locator('#scan-status')).toBeHidden();
 });
+
+test('disabled cloud OCR sends only authenticated config probe and falls back to Tesseract', async ({ page }) => {
+  const requests = [];
+  await page.route('**/api/capture/ocr/**', async route => {
+    const request = route.request();
+    requests.push({ path: new URL(request.url()).pathname, method: request.method(),
+      auth: request.headers()['authorization'] || null,
+      sequence: request.headers()['x-capture-sequence'] || null,
+      body: request.postDataBuffer() || null });
+    await route.continue();
+  });
+  await chooseFile(page);
+  await expect(page.locator('#text')).toHaveValue('TEST OCR RESULT');
+  expect(requests.map(r => r.path)).toEqual(['/api/capture/ocr/config']);
+  const config = requests[0];
+  expect(config.method).toBe('GET');
+  expect(config.auth).toMatch(/^Bearer [0-9a-f-]{36}$/);
+  expect(config.sequence).toBe('1');
+  expect(await page.evaluate(() => window.ocrCalls.length)).toBe(1);
+});
+
+
+test('enabled cloud OCR uploads edited confirmed image without consent dialog, without Tesseract', async ({ page }) => {
+  const uploads = [];
+  await page.route('**/api/capture/ocr/config', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"enabled":true}' }));
+  await page.route('**/api/capture/ocr/config/', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"enabled":true}' }));
+  await page.route('**/api/capture/ocr', async route => {
+    const request = route.request();
+    uploads.push({ method: request.method(), type: request.headers()['content-type'] || '',
+      size: (request.postDataBuffer() || []).length,
+      auth: request.headers()['authorization'] || null,
+      sequence: request.headers()['x-capture-sequence'] || null });
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{"text":"CLOUD OCR RESULT"}' });
+  });
+  const dialogs = [];
+  page.on('dialog', async dialog => { dialogs.push(dialog.type()); await dialog.dismiss(); });
+  await chooseFile(page);
+  await expect(page.locator('#image-editor-overlay')).toHaveCount(0);
+  await expect(page.locator('#text')).toHaveValue('CLOUD OCR RESULT');
+  expect(await page.evaluate(() => window.ocrCalls.length)).toBe(0);
+  expect(uploads).toHaveLength(1);
+  expect(uploads[0].method).toBe('POST');
+  expect(uploads[0].type).toBe('image/jpeg');
+  expect(uploads[0].size).toBeGreaterThan(0);
+  expect(uploads[0].size).toBeLessThanOrEqual(4 * 1024 * 1024);
+  expect(uploads[0].auth).toMatch(/^Bearer [0-9a-f-]{36}$/);
+  expect(uploads[0].sequence).toBe('1');
+  expect(dialogs).toEqual([]);
+  await page.locator('#btn-discard').click();
+  await chooseFile(page);
+  await expect(page.locator('#text')).toHaveValue('CLOUD OCR RESULT');
+  expect(await page.evaluate(() => window.ocrCalls.length)).toBe(0);
+  expect(uploads).toHaveLength(2);
+  expect(dialogs).toEqual([]);
+});
+
+test('cloud failure falls back to local Tesseract', async ({ page }) => {
+  const dialogs = [];
+  page.on('dialog', async dialog => { dialogs.push(dialog.type()); await dialog.dismiss(); });
+  await page.route('**/api/capture/ocr/config', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"enabled":true}' }));
+  await page.route('**/api/capture/ocr/config/', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"enabled":true}' }));
+  await page.route('**/api/capture/ocr', route => route.fulfill({ status: 429, contentType: 'application/json', body: '{"error":"quota"}' }));
+  await chooseFile(page);
+  await expect(page.locator('#text')).toHaveValue('TEST OCR RESULT');
+  expect(await page.evaluate(() => window.ocrCalls.length)).toBe(1);
+  await page.unroute('**/api/capture/ocr');
+  await page.route('**/api/capture/ocr', route => route.fulfill({ status: 401, contentType: 'application/json', body: '{"error":"expired"}' }));
+  await page.locator('#btn-discard').click();
+  await chooseFile(page);
+  await expect(page.locator('#text')).toHaveValue('TEST OCR RESULT');
+  expect(await page.evaluate(() => window.ocrCalls.length)).toBe(2);
+  expect(dialogs).toEqual([]);
+});

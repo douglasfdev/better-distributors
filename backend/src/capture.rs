@@ -22,6 +22,7 @@ const MAX_TEXT: usize = 32_000;
 
 #[derive(Clone, Default)]
 pub struct Captures {
+    ocr: crate::ocr::Ocr,
     origin: Option<String>,
     bind: Option<String>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
@@ -89,7 +90,9 @@ impl Captures {
             std::env::var("CAPTURE_ALLOW_HTTP").as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE")
         );
-        Self::from_values(std::env::var("CAPTURE_PUBLIC_URL").ok(), allow_http)
+        let (mut state, warning) = Self::from_values(std::env::var("CAPTURE_PUBLIC_URL").ok(), allow_http);
+        state.ocr = crate::ocr::Ocr::from_env();
+        (state, warning)
     }
     pub fn enabled(&self) -> bool {
         self.origin.is_some()
@@ -104,6 +107,8 @@ impl Captures {
 
 pub fn local_router(state: Captures) -> Router {
     Router::new()
+        .route("/api/ocr", post(desktop_ocr).layer(DefaultBodyLimit::max(crate::ocr::MAX_IMAGE)))
+        .route("/api/ocr/config", get(ocr_config))
         .route("/api/captures", post(create))
         .route("/api/captures/{id}", get(read).delete(cancel))
         .route("/api/captures/{id}/ack", post(ack))
@@ -121,6 +126,8 @@ pub fn public_router(state: Captures, frontend: &str) -> Router {
             "/bridge.js",
             ServeFile::new(format!("{frontend}/bridge.js")),
         )
+        .route("/api/capture/ocr", post(phone_ocr).layer(DefaultBodyLimit::max(crate::ocr::MAX_IMAGE)))
+        .route("/api/capture/ocr/config", get(phone_ocr_config))
         .route("/api/capture/connect", post(connect))
         .route("/api/capture/submit", post(submit))
         .route("/api/capture/status", post(connect))
@@ -130,6 +137,41 @@ pub fn public_router(state: Captures, frontend: &str) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), public_guard))
         .layer(middleware::from_fn_with_state(state.clone(), protect))
         .with_state(state)
+}
+
+async fn ocr_config(State(state): State<Captures>) -> Json<Value> {
+    Json(json!({"enabled": state.ocr.enabled()}))
+}
+fn authorize_ocr(state: &Captures, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = bearer(headers)?;
+    let mut sessions = state.sessions.lock().unwrap();
+    let s = writer(&mut sessions, token)?;
+    let sequence = headers.get("x-capture-sequence").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if !s.connected || s.ended || s.text.is_some() || sequence != Some(s.sequence) {
+        return Err(error(StatusCode::CONFLICT, "Captura fora de sequência ou encerrada."));
+    }
+    Ok(())
+}
+async fn phone_ocr_config(State(state): State<Captures>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    authorize_ocr(&state, &headers)?;
+    Ok(ocr_config(State(state)).await)
+}
+async fn phone_ocr(State(state): State<Captures>, request: Request) -> Result<Json<Value>, ApiError> {
+    let headers = request.headers().clone();
+    authorize_ocr(&state, &headers)?;
+    let result = state.ocr.recognize(request).await;
+    authorize_ocr(&state, &headers)?;
+    Ok(Json(json!({"text": result?})))
+}
+async fn desktop_ocr(State(state): State<Captures>, request: Request) -> Result<Json<Value>, ApiError> {
+    let headers = request.headers();
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<axum::http::Uri>().ok());
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    if headers.get("x-ocr-request").and_then(|v| v.to_str().ok()) != Some("1")
+        || headers.get("sec-fetch-site").is_some_and(|v| v != "same-origin")
+        || origin.as_ref().is_some_and(|u| u.authority().map(|a| a.as_str()) != host)
+    { return Err(error(StatusCode::FORBIDDEN, "Origem não autorizada.")); }
+    Ok(Json(json!({"text": state.ocr.recognize(request).await?})))
 }
 
 async fn protect(State(state): State<Captures>, request: Request, next: Next) -> Response {
@@ -739,6 +781,93 @@ mod tests {
         let (_, read_a, write_a) = open_session(state.clone()).await;
         let (_, read_b, write_b) = open_session(state.clone()).await;
         assert_ne!(read_a, read_b);
-        assert_ne!(write_a, write_b);
+        assert_ne!(write_b, write_a);
+    }
+
+    #[tokio::test]
+    async fn phone_ocr_requires_sequence_header_and_active_state() {
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
+        let (_, _, _write) = open_session(state.clone()).await;
+        let send = |write: &str, sequence: u64, body: Body| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/capture/ocr")
+                .header("host", "capture.test")
+                .header("origin", "https://capture.test")
+                .header("authorization", format!("Bearer {write}"))
+                .header("x-capture-sequence", sequence.to_string())
+                .header("content-type", "image/jpeg")
+                .body(body)
+                .unwrap();
+            public_router(state.clone(), "frontend").oneshot(request)
+        };
+        let status = |response: axum::response::Response| response.status();
+        let (_, _, write) = open_session(state.clone()).await;
+        assert_eq!(status(send(&write, 1, Body::empty()).await.unwrap()), StatusCode::CONFLICT, "not connected");
+        let _ = public_post(state.clone(), "/api/capture/connect", &write, None, Some("https://capture.test")).await;
+        let response = send(&write, 2, Body::empty()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "sequence ahead");
+        let response = send(&write, 1, Body::empty()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "no ocr provider");
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["text"].is_null(), "error body never carries text: {body}");
+        let _ = public_post(state.clone(), "/api/capture/submit", &write, Some(json!({"text":"hello","sequence":1})), None).await;
+        let response = send(&write, 1, Body::empty()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "pending text blocks cloud ocr");
+    }
+
+    #[tokio::test]
+    async fn desktop_ocr_requires_same_origin_header() {
+        let state = Captures::configured(None, false).unwrap();
+        let build = |origin: Option<&str>, same_site: bool, marker: bool| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/ocr")
+                .header("host", "localhost")
+                .header("content-type", "image/jpeg")
+                .header("sec-fetch-site", if same_site { "same-origin" } else { "cross-site" });
+            if marker { request = request.header("x-ocr-request", "1"); }
+            if let Some(origin) = origin { request = request.header("origin", origin); }
+            request.body(Body::empty()).unwrap()
+        };
+
+        for bad in [
+            build(None, true, false),
+            build(None, false, true),
+            build(Some("http://evil.example"), true, true),
+        ] {
+            let response = local_router(state.clone()).oneshot(bad).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "same-origin guard");
+        }
+        let good = build(Some("http://localhost"), true, true);
+        let response = local_router(state.clone()).oneshot(good).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "OCR disabled falls back to local Tesseract");
+    }
+
+    #[tokio::test]
+    async fn ocr_config_exposes_only_enabled_boolean() {
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
+        let request = Request::builder().uri("/api/ocr/config").header("host", "localhost").body(Body::empty()).unwrap();
+        let response = local_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let keys: Vec<&str> = body.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap();
+        assert_eq!(keys, vec!["enabled"]);
+        assert_eq!(body["enabled"], false, "OCR_PROVIDER unset in tests");
+    }
+
+    #[tokio::test]
+    async fn phone_ocr_config_requires_authorization() {
+        let state = Captures::configured(Some("https://capture.test".into()), false).unwrap();
+        let (_, _read, _write) = open_session(state.clone()).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/capture/ocr/config")
+            .header("host", "capture.test".to_string())
+            .header("authorization", format!("Bearer {}", "wrong"))
+            .body(Body::empty())
+            .unwrap();
+        let response = public_router(state.clone(), "frontend").oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

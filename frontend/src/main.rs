@@ -9,8 +9,8 @@ use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen(module = "/bridge.js")]
 extern "C" {
-    #[wasm_bindgen(catch, js_name = scanImage)]
-    async fn scan_image() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = scanImage, variadic)]
+    async fn scan_image(gallery: JsValue, options: JsValue) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = locate)]
     async fn locate() -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = showMap)]
@@ -315,7 +315,7 @@ fn App() -> impl IntoView {
                 <Show when=move ||tab.get()==0>
                     <header class="page-header"><div><p class="eyebrow">"CRESÇA SUA REDE"</p><h1>{move ||if value(&fields.get(),"id").is_empty(){"Uma nova conexão."}else{"Editar conexão."}}</h1><p class="muted">"Guarde os detalhes de quem pode fazer seu negócio ir além."</p></div><span class="header-tag">"✦ Tudo começa com um contato"</span></header>
                     <div class="registration-layout"><div>
-                    <section class="card scan-card"><div class="scan-icon">"⌁"</div><div><h3>"Do cartão para sua rede."</h3><p class="muted">"Fotografe um cartão ou escolha uma imagem. Revise os dados antes de salvar."</p></div><button class="secondary" disabled=move ||busy.get() on:click=move |_| {busy.set(true);spawn_local(async move {match scan_image().await {Ok(v)=>ocr.set(v.as_string().unwrap_or_default()),Err(e)=>message.set(js_error(e))} busy.set(false);});}>"Escanear cartão ↗"</button></section>
+                    <section class="card scan-card"><div class="scan-icon">"⌁"</div><div><h3>"Do cartão para sua rede."</h3><p class="muted">"Fotografe um cartão ou escolha uma imagem. Revise os dados antes de salvar. Nada é salvo automaticamente."</p></div><button class="secondary" disabled=move ||busy.get() on:click=move |_| {busy.set(true);spawn_local(async move {match scan_image(JsValue::UNDEFINED, JsValue::UNDEFINED).await {Ok(v)=>ocr.set(v.as_string().unwrap_or_default()),Err(e)=>message.set(js_error(e))} busy.set(false);});}>"Escanear cartão ↗"</button></section>
                     <div class="qr-button-wrapper">
                         <CapturePanel ocr=ocr pending=pending />
                     </div>

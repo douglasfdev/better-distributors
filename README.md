@@ -53,12 +53,13 @@ Abra http://localhost:3000. Execute o servidor a partir da raiz. Configurações
 
 **É um MVP local, sem login nem isolamento por usuário. Não exponha diretamente à internet ou a uma rede não confiável.** Todos os clientes com acesso à API consultam e alteram a mesma base. A implantação pública exige autenticação, autorização, HTTPS, proteção contra abuso, backups e política de retenção/LGPD.
 
-O OCR roda no navegador; a imagem não é enviada à API nem armazenada. Tesseract e seus modelos de idioma são obtidos de serviços externos. O mapa também depende de recursos e tiles externos, cujos provedores recebem requisições de rede. Não há suporte offline completo. Revise as políticas dos provedores antes do uso em produção.
+O OCR roda no navegador por padrão (Tesseract local); a imagem não é enviada à API nem armazenada. Opcionalmente, com `OCR_PROVIDER=gemini` e `GEMINI_API_KEY` no servidor, a imagem **editada e confirmada** (recorte/rotação, normalizada a ≤2048 px JPEG, sem metadados) é transmitida pela aplicação à API do Google apenas sob confirmação explícita no navegador (na prática gratuita, o Google pode usar imagem/texto para melhoria dos produtos, conforme a política vigente). No plano gratuito sem faturamento, a chave do Google é de uso pessoal; solicite-a fora do chat e nunca a publique. O limite diário `OCR_DAILY_LIMIT` é contabilizado somente na memória do processo (sem persistência) e não garante uso gratuito nem evita cobrança; se o Google indicar limite, o servidor aplica um intervalo de espera e o navegador usa o OCR local. Tesseract e seus modelos de idioma são obtidos de serviços externos. O mapa também depende de recursos e tiles externos, cujos provedores recebem requisições de rede. Não há suporte offline completo. Revise as políticas dos provedores antes do uso em produção.
 
 - O seletor com `capture` pode abrir a câmera no celular, mas o comportamento depende do navegador. Também é possível selecionar uma foto existente.
 - Geolocalização exige permissão e contexto seguro (HTTPS ou localhost). A localização atual do aparelho **não é necessariamente o endereço da loja**; só use estando no estabelecimento.
 - Não há geocodificação automática: endereço textual não cria um marcador. Informe latitude e longitude ou use a posição atual após confirmação.
-- OCR não garante identificação correta de campos e não extrai automaticamente tabelas completas de produtos ou manuscritos complexos.
+- OCR não garante identificação correta de campos e não extrai automaticamente tabelas completas de produtos ou manuscritos complexos. O modelo de OCR é instruído a transcrever literalmente; ele não tem acesso a ferramentas, mas pode falhar ou inventar trechos ilegíveis — a revisão humana do texto antes de salvar continua obrigatória.
+- OCR Google é opt-in por variáveis de ambiente do servidor; sem isso nada sai do dispositivo.
 - Catálogo por link e produtos cadastrados; upload persistente de PDF/imagens ainda não implementado.
 - Não há otimização de roteiros, leitura de códigos de barras, estatísticas de preços nem histórico de preços nesta etapa.
 - A base não contém dados fictícios. Faça backup do arquivo `distributors.db` com o servidor parado.
@@ -67,6 +68,7 @@ O OCR roda no navegador; a imagem não é enviada à API nem armazenada. Tessera
 ## Validações executadas
 
 - 13 testes Rust de domínio/API: opcionais, links, coordenadas, preços, CRUD, persistência e restrição de hosts/origens.
+- Testes adicionais do OCR Google (com provedor simulado, sem chamada real): autenticação por bearer e sequência, guarda de mesma origem, limites de tamanho/tipo, cota diária, 429 e respostas inválidas e exposição apenas do booleano `enabled`.
 - Checagem do frontend para `wasm32-unknown-unknown`.
 - Análise estática Clippy do backend/modelo e frontend WASM sem warnings.
 - `trunk build` concluído.
@@ -89,6 +91,14 @@ O servidor carrega automaticamente o arquivo **`.env` na raiz do projeto** (`car
 | `CAPTURE_PUBLIC_URL` | (definida) | Origem que o celular acessa: HTTPS (túnel) ou HTTP local com `CAPTURE_ALLOW_HTTP=1` |
 | `CAPTURE_BIND_ADDR` | `127.0.0.1:3001` | Porta da página pública de captura |
 | `CAPTURE_FRONTEND_DIR` | `frontend` | Pasta com `capture.html`/`bridge.js` |
+| `OCR_PROVIDER` | (desativado) | `gemini` ativa o OCR remoto; qualquer outro valor usa apenas OCR local |
+| `GEMINI_API_KEY` | (nenhuma) | Chave do Google, somente do lado do servidor; nunca no navegador nem no chat |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Modelo do endpoint `generateContent` fixo |
+| `OCR_DAILY_LIMIT` | `20` | Teto diário estimativo, apenas em memória; sem garantia de custo zero |
+
+### OCR Google (opcional)
+
+Para acionar a leitura no servidor, o `.env` precisa de `OCR_PROVIDER=gemini` e `GEMINI_API_KEY=<sua chave>`; obtenha a chave no painel do Google AI Studio (camada gratuita, sem faturamento obrigatório). A chave é usada somente pelo servidor via cabeçalho `x-goog-api-key` no endpoint fixo `generativelanguage.googleapis.com`, com timeout (25 s) e sem redirecionamentos; nada é registrado em log nem persistido. Sem modelo configurado, usa-se `GEMINI_MODEL=gemini-3.5-flash-lite`. `OCR_DAILY_LIMIT` (padrão 20/dia) é um teto conservador contabilizado apenas **na memória do processo** — não são garantias de custo; ao reiniciar, o contador zera. Entradas aceitas: ≤4 MiB de imagem JPEG/PNG, até 2048 px por lado; 2 execuções simultâneas no máximo, sem tentativas de reenvio. Em 429 do Google o servidor entra em espera e o cliente cai automaticamente para o OCR local. Ativação em produção: injete as variáveis no `.env.production` do servidor (o `env_file` do Compose já carrega os valores).
 
 ### Captura por QR Code: mesmo Wi‑Fi e 4G/5G
 
@@ -104,7 +114,7 @@ cloudflared tunnel --url http://127.0.0.1:3001
 cargo run -p distributor-server
 ```
 
-O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos (prazo absoluto) e permite várias capturas, uma por vez. Depois de enviar, o celular aguarda o PC revisar e **salvar com sucesso**; só então uma confirmação libera a próxima captura na mesma página. Falhas de salvamento não liberam o celular. Use **Encerrar sessão** no celular ou **Fechar captura** no PC; a página mostra o encerramento sem depender de `window.close()`. Não são expostos lojas, painel nem a foto do cartão — o OCR roda no próprio navegador.
+O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos (prazo absoluto) e permite várias capturas, uma por vez. Depois de enviar, o celular aguarda o PC revisar e **salvar com sucesso**; só então uma confirmação libera a próxima captura na mesma página. Falhas de salvamento não liberam o celular. Use **Encerrar sessão** no celular ou **Fechar captura** no PC; a página mostra o encerramento sem depender de `window.close()`. Não são expostos lojas, painel nem a foto do cartão — o OCR local roda no próprio navegador, e o OCR Google opcional transmite apenas a imagem editada e confirmada, sob autorização (bearer + sequência) e confirmação explícita.
 
 O protocolo usa polling, sem WebSocket: token de escrita somente no bridge público, token de leitura/confirmação somente no painel local. Cada envio e confirmação contém uma sequência; reenvio idêntico é idempotente, confirmações antigas não liberam capturas novas, e transições são serializadas no backend. O painel repete confirmações em falhas transitórias após salvar, sem salvar a loja novamente. Sessões ficam em memória e são invalidadas ao reiniciar o servidor; recarregar a página do celular perde o token (removido do endereço por segurança). A confirmação é uma declaração do painel local após resposta de sucesso da API de lojas, não uma transação SQLite conjunta.
 

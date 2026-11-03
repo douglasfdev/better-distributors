@@ -2,7 +2,13 @@ Better Distributors — informações de privacidade do MVP local
 
 Os cadastros são armazenados no arquivo SQLite do servidor. Esta versão não possui contas de usuário: qualquer pessoa com acesso à API pode consultar e alterar os registros.
 
-O reconhecimento de texto (OCR) processa a foto no navegador. A imagem não é enviada ao servidor da aplicação e não é guardada no cadastro. Bibliotecas e modelos de idioma são baixados de CDNs externos.
+O reconhecimento de texto (OCR) tem dois modos possíveis:
+
+- Local (padrão): a foto é processada apenas no navegador pelo Tesseract; nada é enviado para OCR.
+- Google Gemini (opcional, se o OCR_PROVIDER estiver habilitado no servidor): a imagem recortada/rotacionada após sua confirmação é enviada pelo servidor da aplicação à API do Google, sem a chave de API. No plano gratuito do Gemini, dados como imagem e texto podem ser usados pelo Google para melhorar seus produtos (a política vigente prevalece). Antes de enviar, o navegador mostra um aviso, e é possível escolher usar o modo local. Nenhuma contabilidade de custo é garantida pela aplicação; os limites diários configurados são rastreados apenas em memória, sem persistência nem cobrança.
+- Em ambos os modos, o texto reconhecido exige revisão humana e nada é salvo automaticamente.
+
+Bibliotecas e modelos de idioma locais são baixados de CDNs externos.
 
 Mapas usam Leaflet e tiles OpenStreetMap. Fontes e bibliotecas podem vir de Google Fonts, unpkg e jsDelivr. Esses provedores recebem requisições do navegador (incluindo endereço IP); os tiles solicitados indicam a área visualizada.
 
