@@ -81,7 +81,7 @@ jobs:
           sha="$1"
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           release="releases/$sha"
-          test -f .env.production
+          test -s .env.production
           docker compose version
           gzip -dc "$release/image.tar.gz" | docker load
           rm -f "$release/image.tar.gz"
@@ -95,7 +95,7 @@ jobs:
             cp compose.yml compose.previous.yml
             previous=true
           fi
-          rollback() {
+          rollback_app() {
             trap - ERR INT TERM
             if "$previous"; then
               docker compose --env-file .env.previous -f compose.previous.yml up -d --wait --wait-timeout 120
@@ -106,7 +106,7 @@ jobs:
             fi
             exit 1
           }
-          trap rollback ERR INT TERM
+          trap rollback_app ERR INT TERM
           docker compose --env-file .env.candidate -f compose.candidate.yml up -d --wait --wait-timeout 120
           cp compose.candidate.yml compose.yml
           mv .env.candidate .env.release

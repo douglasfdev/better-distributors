@@ -28,4 +28,6 @@ Exemplo de criação:
 }
 ```
 
+A persistência exige `DATABASE_URL` PostgreSQL. Na inicialização, o servidor executa `CREATE TABLE IF NOT EXISTS stores` no schema do `search_path`; isso não migra SQLite nem atualiza tabelas incompatíveis. O pool usa no máximo 5 conexões e desativa o cache de statements para compatibilidade com transaction pooling. Consulte o README para configuração Supabase, permissões e backups.
+
 O contrato completo está em `shared/src/lib.rs`. A API não faz geocodificação, não transfere URLs cadastradas e não recebe fotos para OCR.

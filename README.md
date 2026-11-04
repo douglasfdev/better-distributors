@@ -11,7 +11,7 @@ rustup target add wasm32-unknown-unknown
 cargo install trunk --version 0.21.14 --locked
 ```
 
-Na raiz, execute a API:
+Configure primeiro `DATABASE_URL` em `.env` (veja PostgreSQL/Supabase abaixo). É necessário um PostgreSQL acessível; SQLite não é mais utilizado. Na raiz, execute a API:
 
 ```powershell
 cargo run -p distributor-server
@@ -35,7 +35,7 @@ cd ..
 cargo run -p distributor-server --release
 ```
 
-Abra http://localhost:3000. Execute o servidor a partir da raiz. Configurações opcionais: `DATABASE_URL` (padrão `sqlite://distributors.db?mode=rwc`), `BIND_ADDR` (padrão `127.0.0.1:3000`) e `FRONTEND_DIST` (padrão `frontend/dist`). `ALLOWED_HOSTS` define os hosts permitidos, separados por vírgulas (padrão `localhost,127.0.0.1,[::1]`); ao configurar um proxy HTTPS, inclua seu hostname explicitamente. Esta proteção não substitui autenticação.
+Abra http://localhost:3000. Execute o servidor a partir da raiz. `DATABASE_URL` é obrigatória e deve apontar para PostgreSQL. Configurações opcionais: `BIND_ADDR` (padrão `127.0.0.1:3000`) e `FRONTEND_DIST` (padrão `frontend/dist`). `ALLOWED_HOSTS` define os hosts permitidos, separados por vírgulas (padrão `localhost,127.0.0.1,[::1]`); ao configurar um proxy HTTPS, inclua seu hostname explicitamente. Esta proteção não substitui autenticação.
 
 ## Funcionalidades
 
@@ -46,7 +46,7 @@ Abra http://localhost:3000. Execute o servidor a partir da raiz. Configurações
 - Captura/importação via seletor nativo de imagens e OCR no navegador. Texto reconhecido precisa de revisão humana.
 - Mapa Leaflet/OpenStreetMap para coordenadas cadastradas.
 - Contatos acionáveis e navegação externa na ficha; aviso de possível duplicidade ao criar cadastro.
-- Persistência SQLite no servidor, não apenas no armazenamento do navegador.
+- Persistência PostgreSQL no servidor, não apenas no armazenamento do navegador.
 - Validação no servidor e no modelo compartilhado.
 
 ## Privacidade e limites desta versão
@@ -62,7 +62,7 @@ O OCR roda no navegador por padrão (Tesseract local); a imagem não é enviada 
 - OCR Google é opt-in por variáveis de ambiente do servidor; sem isso nada sai do dispositivo.
 - Catálogo por link e produtos cadastrados; upload persistente de PDF/imagens ainda não implementado.
 - Não há otimização de roteiros, leitura de códigos de barras, estatísticas de preços nem histórico de preços nesta etapa.
-- A base não contém dados fictícios. Faça backup do arquivo `distributors.db` com o servidor parado.
+- A base não contém dados fictícios. Faça backups PostgreSQL com `pg_dump` e teste a restauração (veja abaixo).
 - O manifesto permite metadados de instalação onde suportados; não há service worker nem garantia de instalação/offline em todos os navegadores.
 
 ## Validações executadas
@@ -84,7 +84,17 @@ O servidor carrega automaticamente o arquivo **`.env` na raiz do projeto** (`car
 
 | Variável | Padrão | Uso |
 |---|---|---|
-| `DATABASE_URL` | `sqlite://distributors.db?mode=rwc` | Banco SQLite |
+| `DATABASE_URL` | (obrigatória, sem padrão) | URL PostgreSQL completa, somente no servidor |
+
+### Aspas e caracteres especiais no `.env`
+
+No `.env`, envolva a URL completa em **aspas duplas** quando houver espaços ou caracteres especiais:
+
+```dotenv
+DATABASE_URL="postgres://postgres:minhasenha@localhost:5432/distributors?sslmode=require"
+```
+
+As aspas não substituem a codificação obrigatória:** caractere `#` na senha **deve** ser percent-encodado como `%23`, senão o `#` inicia um comentário no arquivo e trunca a URL — as interface não lê segredos do chat nem registra o valor no log, conforme definido em ambiente seguro.
 | `BIND_ADDR` | `127.0.0.1:3000` | Endereço do painel (PC) |
 | `FRONTEND_DIST` | `frontend/dist` | Build do frontend servido pelo backend |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Hosts autorizados à API local |
@@ -95,6 +105,16 @@ O servidor carrega automaticamente o arquivo **`.env` na raiz do projeto** (`car
 | `GEMINI_API_KEY` | (nenhuma) | Chave do Google, somente do lado do servidor; nunca no navegador nem no chat |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Modelo do endpoint `generateContent` fixo |
 | `OCR_DAILY_LIMIT` | `20` | Teto diário estimativo, apenas em memória; sem garantia de custo zero |
+
+### PostgreSQL / Supabase
+
+No dashboard do seu projeto Supabase, abra **Connect**, selecione **Transaction pooler** (porta **6543**) e copie a URL PostgreSQL completa fornecida pelo painel para `DATABASE_URL`. Não deduza o hostname ou usuário a partir do ID do projeto. Substitua o marcador de senha pela senha real do banco, com caracteres especiais percent-encoded (por exemplo, `@` → `%40`, `#` → `%23`, `%` → `%25`); codifique somente a senha, sem duplicar a codificação. Entre aspas duplas a senha fica protegida de espaços e `#` literal; o `#` percent-encodado (`%23`) continua obrigatório dentro e fora de aspas, pois em dotenv o `#` comentado trunca o valor na leitura. Inclua `sslmode=require` na query (`?` para o primeiro parâmetro, `&` para os seguintes). Não use a chave anon/service-role como senha. Nunca publique a URL nem a envie ao navegador, logs ou artifacts.
+
+O backend exige PostgreSQL, promove TLS `prefer`/`allow` para `require`, desativa o cache de statements do cliente e limita o pool a **5 conexões por processo**. `sslmode=disable` é apenas para PostgreSQL local de desenvolvimento/testes. Supabase remoto exige conectividade; o pareamento local de captura não torna a persistência offline.
+
+Use projeto/banco e credenciais dedicados à aplicação, com privilégios mínimos. Na inicialização, o backend executa `CREATE TABLE IF NOT EXISTS stores` no schema resolvido pelo `search_path` (normalmente `public`), com `id TEXT`, `data TEXT` e `insertion_order BIGINT GENERATED ALWAYS AS IDENTITY`. A credencial precisa permitir essa inicialização, acesso à tabela e à sequência; não há gerenciador de migrações nem ajuste automático de tabelas incompatíveis. **Não há migração automática de SQLite:** preserve o arquivo/volume antigo, planeje exportação/importação explícita e valide os dados antes de desativá-lo.
+
+O backend não configura RLS nem políticas Supabase. Se `public` estiver exposto pela Data API, restrinja grants de `anon`/`authenticated` e configure RLS/políticas adequadas ou desative essa exposição. Não presuma que RLS protege conexões de owners ou roles com `BYPASSRLS`; ela também não adiciona autenticação à API Axum. Não compartilhe este banco com testes.
 
 ### OCR Google (opcional)
 
@@ -116,7 +136,7 @@ cargo run -p distributor-server
 
 O gerenciamento (cadastros e painel) fica apenas em `BIND_ADDR` (127.0.0.1 por padrão) e **não** é publicado pelo túnel. A sessão do QR expira em 15 minutos (prazo absoluto) e permite várias capturas, uma por vez. Depois de enviar, o celular aguarda o PC revisar e **salvar com sucesso**; só então uma confirmação libera a próxima captura na mesma página. Falhas de salvamento não liberam o celular. Use **Encerrar sessão** no celular ou **Fechar captura** no PC; a página mostra o encerramento sem depender de `window.close()`. Não são expostos lojas, painel nem a foto do cartão — o OCR local roda no próprio navegador, e o OCR Google opcional transmite apenas a imagem editada e confirmada, sob autorização (bearer + sequência) e confirmação explícita.
 
-O protocolo usa polling, sem WebSocket: token de escrita somente no bridge público, token de leitura/confirmação somente no painel local. Cada envio e confirmação contém uma sequência; reenvio idêntico é idempotente, confirmações antigas não liberam capturas novas, e transições são serializadas no backend. O painel repete confirmações em falhas transitórias após salvar, sem salvar a loja novamente. Sessões ficam em memória e são invalidadas ao reiniciar o servidor; recarregar a página do celular perde o token (removido do endereço por segurança). A confirmação é uma declaração do painel local após resposta de sucesso da API de lojas, não uma transação SQLite conjunta.
+O protocolo usa polling, sem WebSocket: token de escrita somente no bridge público, token de leitura/confirmação somente no painel local. Cada envio e confirmação contém uma sequência; reenvio idêntico é idempotente, confirmações antigas não liberam capturas novas, e transições são serializadas no backend. O painel repete confirmações em falhas transitórias após salvar, sem salvar a loja novamente. Sessões ficam em memória e são invalidadas ao reiniciar o servidor; recarregar a página do celular perde o token (removido do endereço por segurança). A confirmação é uma declaração do painel local após resposta de sucesso da API de lojas, não uma transação PostgreSQL conjunta.
 
 ### Alternativa offline (mesma rede, sem túnel)
 
@@ -136,16 +156,17 @@ O workflow separado `Deploy` executa somente após `CI` concluir com sucesso em 
 
 ### Preparação do servidor
 
-Use um VPS Linux amd64 com Docker Engine e o plugin Docker Compose v2 com suporte a `up --wait`, além de Bash, gzip e flock (util-linux). Instale Docker pelo procedimento oficial da distribuição antes do primeiro deploy. O usuário de deploy precisa executar `docker` sem sudo (acesso ao grupo Docker equivale a root). Crie `/opt/better-distributors`, de propriedade desse usuário, com permissão `0700`. Reserve espaço para compilação no runner e, no VPS, para o arquivo comprimido, a imagem nova, a anterior e o banco; monitore disco e logs do Docker.
+Use um VPS Linux amd64 com Docker Engine e o plugin Docker Compose v2 com suporte a `up --wait`, além de Bash, gzip e flock (util-linux). Instale Docker pelo procedimento oficial da distribuição antes do primeiro deploy. O usuário de deploy precisa executar `docker` sem sudo (acesso ao grupo Docker equivale a root). Crie `/opt/better-distributors`, de propriedade desse usuário, com permissão `0700`. Reserve espaço para compilação no runner e, no VPS, para o arquivo comprimido, a imagem nova e a anterior; o banco é externo ao container; monitore disco e logs do Docker.
 
-Crie manualmente `/opt/better-distributors/.env.production` com permissão `0600`, sem versioná-lo nem enviá-lo como artifact. Exemplo (substitua o domínio de captura):
+Crie manualmente `/opt/better-distributors/.env.production` com permissão `0600`, sem versioná-lo nem enviá-lo como artifact. Preencha `DATABASE_URL` com a URL completa do painel Supabase, incluindo senha codificada e `sslmode=require`, conforme acima. Exemplo (preencha o banco e substitua o domínio de captura):
 
 ```dotenv
+DATABASE_URL=
 ALLOWED_HOSTS=localhost,127.0.0.1,[::1]
 CAPTURE_PUBLIC_URL=https://capture.example.com
 ```
 
-O Compose fixa os binds internos em `0.0.0.0:3000` e `0.0.0.0:3001`, os caminhos dos assets e `DATABASE_URL=sqlite:///data/distributors.db?mode=rwc`; não tente sobrescrevê-los no arquivo. HTTP de captura é desativado. Inclua `127.0.0.1` em `ALLOWED_HOSTS` para o healthcheck e adicione o hostname de qualquer proxy privado autorizado. O volume nomeado `better-distributors-data` recebe `/data` com proprietário UID/GID `10001:10001` na primeira criação. Volumes existentes precisam dessa propriedade corrigida antes do deploy. O processo roda sem root, com certificados CA e curl instalados.
+O Compose mantém `env_file: .env.production`: `DATABASE_URL` vem desse arquivo, sem override no Compose ou na imagem. Os binds internos são fixos em `0.0.0.0:3000` e `0.0.0.0:3001`, assim como os caminhos dos assets. HTTP de captura é desativado. Inclua `127.0.0.1` em `ALLOWED_HOSTS` para o healthcheck e adicione o hostname de qualquer proxy privado autorizado. Não há volume de banco nem diretório `/data`; PostgreSQL é administrado separadamente. O processo roda sem root (UID/GID `10001:10001`), com certificados CA e curl instalados.
 
 ### GitHub e SSH
 
@@ -167,7 +188,7 @@ As duas portas são publicadas **somente em 127.0.0.1 do VPS**. Não abra 3000/3
 
 Para celulares, configure um reverse proxy HTTPS no host para encaminhar **somente o serviço de captura** a `127.0.0.1:3001`, usando a origem de `CAPTURE_PUBLIC_URL`. Nunca encaminhe esse domínio para 3000. Configure limites de requisições e tamanho, TLS e controles de acesso apropriados; preserve o protocolo HTTPS e teste o fluxo QR real. Não há endpoint de deploy ou administração exposto pela aplicação.
 
-O deploy carrega a imagem localmente, valida o Compose e aguarda o healthcheck `GET /api/stores`. `.env.release` guarda `APP_IMAGE` do release ativo; `.env.previous` e `compose.previous.yml` preservam o anterior. Se a atualização falhar, o workflow tenta restaurar a imagem e o Compose anteriores e termina com erro; no primeiro deploy, remove os containers sem apagar o volume. Falhas de SSH/energia podem exigir intervenção manual. Para rollback manual, execute na pasta `/opt/better-distributors`:
+O deploy carrega a imagem localmente, valida o Compose e aguarda o healthcheck `GET /api/stores`. `.env.release` guarda `APP_IMAGE` do release ativo; `.env.previous` e `compose.previous.yml` preservam o anterior. Se a atualização falhar, o workflow tenta restaurar a imagem e o Compose anteriores e termina com erro; no primeiro deploy, remove os containers. O rollback é somente da aplicação; ambos os releases usam o `DATABASE_URL` atual de `.env.production`. Não volte a uma imagem/Compose SQLite após a migração para PostgreSQL. Falhas de SSH/energia podem exigir intervenção manual. Para rollback manual, execute na pasta `/opt/better-distributors`:
 
 ```bash
 docker compose --env-file .env.previous -f compose.previous.yml up -d --wait --wait-timeout 120
@@ -175,24 +196,63 @@ cp compose.previous.yml compose.yml
 cp .env.previous .env.release
 ```
 
-Não remova a imagem anterior com `docker image prune -a`; retenha pelo menos as imagens referenciadas em `.env.release` e `.env.previous`. As transferências ficam em `releases/<SHA>`; o arquivo comprimido é removido após `docker load`. Revise e limpe releases antigos conforme a política de retenção. O rollback de imagem **não desfaz migrações nem alterações no SQLite**.
+Não remova a imagem anterior com `docker image prune -a`; retenha pelo menos as imagens referenciadas em `.env.release` e `.env.previous`. As transferências ficam em `releases/<SHA>`; o arquivo comprimido é removido após `docker load`. Revise e limpe releases antigos conforme a política de retenção. O rollback de imagem **não restaura PostgreSQL nem desfaz alterações de schema/dados**; confirme compatibilidade do release anterior antes de usá-lo.
 
 ### Backup e recuperação
 
-Antes de atualizar versões com alterações no banco, pare o serviço com `docker compose --env-file .env.release stop app`, faça backup de todo o volume `better-distributors-data` (incluindo eventuais arquivos WAL/SHM), e reinicie com `docker compose --env-file .env.release up -d --wait`. Use ferramenta de backup de volumes ou container auxiliar confiável com o volume montado somente para leitura enquanto o serviço está parado. Mantenha backups criptografados fora do VPS, defina retenção e teste a restauração com UID/GID `10001:10001`. Nunca execute `docker compose down -v` em produção. Imagens Docker e rollback não são backup dos dados.
+Use `pg_dump` de versão compatível com o servidor PostgreSQL antes de mudanças de schema. Para ferramentas administrativas, obtenha no **Connect** do Supabase a conexão direta ou session pooler apropriada; não reutilize automaticamente o transaction pooler. Configure `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGSSLMODE=require` e um `PGPASSFILE` protegido (permissão `0600` no Linux), sem senha na linha de comando/histórico:
 
+```bash
+pg_dump --format=custom --no-owner --no-acl --file=distributors.dump
+pg_restore --dbname=distributors_restore --no-owner --no-acl distributors.dump
+```
+
+A restauração acima exige um banco vazio separado, previamente criado para teste; nunca aponte para produção sem um plano de recuperação. `pg_dump` fornece snapshot consistente sem parar o serviço; para cutover de migração, suspenda gravações e valide contagens/dados. Mantenha backups criptografados fora do VPS, defina retenção e teste a restauração. Imagens Docker e rollback não são backup dos dados. Preserve backups SQLite antigos até concluir e validar a importação manual.
+
+## Migrar do SQLite legado para PostgreSQL
+
+O antigo `distributors.db` (SQLite) não é migrado automaticamente. Use o exportador standalone, que abre o banco **somente leitura** (`?mode=ro`), nunca altera o arquivo e nunca executa SQL no PostgreSQL de destino:
+
+```powershell
+python export_sqlite.py --source distributors.db --output migration_stores.sql
+```
+
+O `--output` gere um arquivo transactional com todas as inserções dentro de um `BEGIN`/`COMMIT`; falha em qualquer linha reverte todo o import. O arquivo gera `createdb` registra o schema atual (`stores` apenas, colunas `id` e `data`). O SQL resultante:
+
+- Contém apenas o schema e os dados relevantes; sem credenciais, `DATABASE_URL` ou segredos.
+- Escapa todas as strings como literais PostgreSQL robustos (`E'...'`), com aspas, contrabarras (`\\`), Unicode, `NULL`, booleanos, números finitos e sem injeção por conteúdo do banco.
+- Converte IDs UUID legados do SQLite para **ULIDs** (26 caracteres, ordenáveis por tempo), mantendo a tabela temporária `store_id_mapping` (`old_id` → `new_id`) no mesmo Lote para rastreio de todas as referências cruzadas.
+- Trunca a importação se a tabela `stores` no PostgreSQL de destino não estiver vazia, evitando sobrescrever registros existentes.
+- A primeira execução nunca sobrescreve um `--output` existente; escolha um nome de arquivo novo por execução.
+
+Importe no PostgreSQL com `\set ON_ERROR_STOP` para abortar o `psql` no primeiro erro e reverte a transação:
+
+```bash
+psql -v ON_ERROR_STOP=1 -f migration_stores.sql
+```
+
+Faça backup antes (`pg_dump`, seção abaixo), teste em banco de teste primeiro e nunca aponte para produção sem validar. O SQL gerado segue transação; o `psql` sem `ON_ERROR_STOP` pode mascarar falhas parciais. Ajustes finais com o editor ou patches são opcionais; o `psql` deve rodar com o mesmo encoding UTF-8 e `client_min_messages` padrão.
+
+Os ULIDs novos **coexistem** com IDs legados do PostgreSQL: o backend continua aceitando e atualizando registros cujo `id` ainda é UUID, sem destruição automática de dados antigos; apenas **novos** cadastros recebem ULIDs. Tokens de autorização da captura permanecem `uuid` aleatórios (não afetados). `capture.rs` também usa `uuid::Uuid`, preservando porte UUID→ULID aqui.
 ## Estrutura
 
 - `frontend/`: interface Rust/Leptos, CSS e bridge JavaScript para OCR/mapa/geolocalização.
-- `backend/`: API Axum e persistência SQLite.
+- `backend/`: API Axum e persistência PostgreSQL.
 - `shared/`: contratos de dados e validação comum.
 - `src/main.rs`: arquivo inicial preservado, fora do workspace ativo.
 
 ## Testes
 
+Os testes de banco exigem `TEST_DATABASE_URL` apontando para um PostgreSQL descartável dedicado, nunca produção; não usam `DATABASE_URL`. A role precisa criar/remover schemas isolados por teste. A CI usa PostgreSQL 17 (`postgres`/`postgres`, banco `distributors_test`) com healthcheck `pg_isready`. O E2E roda depois dos testes nativos e usa o mesmo banco local seguro via `DATABASE_URL`, na tabela padrão, enquanto os testes nativos usam schemas próprios. `OCR_PROVIDER=local` e `GEMINI_API_KEY` vazia impedem chamadas reais ao Google.
+
+Com esse banco local criado e acessível:
+
 ```powershell
+$env:TEST_DATABASE_URL = 'postgres://postgres:postgres@localhost:5432/distributors_test?sslmode=disable'
+$env:OCR_PROVIDER = 'local'
+$env:GEMINI_API_KEY = ''
 cargo test -p distributor-model -p distributor-server
 cargo check -p distributor-web --target wasm32-unknown-unknown
 ```
 
-Próximas etapas de produção: autenticação/equipes, PostgreSQL/PostGIS e migrações, armazenamento privado de anexos, geocodificação contratada, testes em aparelhos reais e rotas com múltiplas paradas.
+Próximas etapas de produção: autenticação/equipes, PostGIS e migrações versionadas, armazenamento privado de anexos, geocodificação contratada, testes em aparelhos reais e rotas com múltiplas paradas.

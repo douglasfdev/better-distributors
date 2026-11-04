@@ -13,6 +13,8 @@
 **/*.db
 **/*.db-*
 **/*.sqlite*
+**/*.dump
+**/*.backup.sql
 **/test-results
 **/playwright-report
 .github
